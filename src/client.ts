@@ -115,12 +115,19 @@ export class ClaudeUsageClient {
     if (r.status !== 200) {
       throw new Error(`token refresh failed: ${r.status}`);
     }
-    const data = JSON.parse(r.body) as { access_token: string; expires_in: number };
+    const data = JSON.parse(r.body) as {
+      access_token: string;
+      expires_in: number;
+      refresh_token?: string;
+    };
     const updated: ClaudeCredentials = {
       ...creds,
       claudeAiOauth: {
         ...creds.claudeAiOauth,
         accessToken: data.access_token,
+        // The token endpoint rotates the refresh_token on every use — keep the
+        // new one, or the next refresh fails with invalid_grant.
+        refreshToken: data.refresh_token ?? creds.claudeAiOauth.refreshToken,
         expiresAt: Date.now() + data.expires_in * 1000,
       },
     };
