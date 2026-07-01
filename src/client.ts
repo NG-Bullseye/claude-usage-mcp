@@ -9,6 +9,10 @@ import { ClaudeApiUsageResponse, ClaudeCredentials } from "./types.js";
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
 const OAUTH_BETA = "oauth-2025-04-20";
+// Claude Code's public OAuth client id. The token endpoint rejects a refresh
+// request that omits it with 400 "Invalid request format". This is the public
+// identifier of the Claude Code app, not a secret.
+const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 const log = (line: string) => console.error(`[client] ${line}`);
 
@@ -108,6 +112,7 @@ export class ClaudeUsageClient {
         body: JSON.stringify({
           refresh_token: creds.claudeAiOauth.refreshToken,
           grant_type: "refresh_token",
+          client_id: OAUTH_CLIENT_ID,
         }),
       },
       this.httpState,
