@@ -11,12 +11,14 @@
 //   "unknown" rather than "quota exhausted" (e.g. not logged in, rate-limited).
 import { ClaudeUsageClient, UsageUnavailableError } from "./client.js";
 import { buildReport } from "./forecast.js";
+import { maybeNotifyThreshold } from "./webhook.js";
 
 async function main() {
   const client = new ClaudeUsageClient();
   try {
     const usage = await client.fetchUsage();
     const report = buildReport(usage);
+    await maybeNotifyThreshold(report);
     process.stdout.write(JSON.stringify(report) + "\n");
     process.exit(0);
   } catch (e) {

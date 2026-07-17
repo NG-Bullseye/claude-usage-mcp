@@ -6,6 +6,7 @@ import { z } from "zod";
 import { ClaudeUsageClient, UsageUnavailableError } from "./client.js";
 import { buildReport, computeForecast } from "./forecast.js";
 import { ALIAS_TO_KEY, WindowAlias } from "./types.js";
+import { maybeNotifyThreshold } from "./webhook.js";
 
 const client = new ClaudeUsageClient();
 
@@ -32,6 +33,7 @@ server.registerTool(
     try {
       const usage = await client.fetchUsage();
       const report = buildReport(usage);
+      await maybeNotifyThreshold(report);
       const lines: string[] = [];
       for (const [name, f] of Object.entries(report.windows)) {
         if (!f) continue;

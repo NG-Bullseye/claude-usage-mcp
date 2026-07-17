@@ -85,6 +85,41 @@ Claude Desktop (`claude_desktop_config.json`), or any stdio MCP client:
 }
 ```
 
+## Threshold webhook (optional)
+
+Get notified — by any system you choose — when a usage window crosses a
+threshold. Disabled by default; opt in by setting `CLAUDE_USAGE_WEBHOOK_URL`.
+Fires on every `get_usage` call and every `dist/cli.js` run (so it's only as
+frequent as whatever already polls this package), independent of client:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `CLAUDE_USAGE_WEBHOOK_URL` | unset (disabled) | Where to `POST` the alert. Any HTTP endpoint. |
+| `CLAUDE_USAGE_WEBHOOK_THRESHOLD_PCT` | `80` | Utilization % that triggers the first alert for a window. |
+| `CLAUDE_USAGE_WEBHOOK_COOLDOWN_MIN` | `30` | Minutes between repeat alerts while a window stays above the threshold. Dropping back below clears it, so the next rise alerts immediately. |
+| `CLAUDE_USAGE_WEBHOOK_EXTRA_FIELDS_JSON` | unset | JSON object merged into every payload — e.g. `{"channel":"#alerts"}` for a Slack incoming webhook, or a routing tag your own receiver expects. |
+
+Payload (`Content-Type: application/json`):
+
+```json
+{
+  "event": "claude_usage_threshold",
+  "window": "5h",
+  "utilization_pct": 87,
+  "threshold_pct": 80,
+  "resets_at": "2026-07-17T14:39:27.672Z",
+  "remaining_hours": 3,
+  "velocity_recommendation": 49,
+  "message": "Claude usage (5h) at 87%, over the 80% threshold. Resets in 3h. throttle hard — ~49% of your current pace."
+}
+```
+
+The `message` field is a ready-to-post string — point `CLAUDE_USAGE_WEBHOOK_URL`
+at a Slack/Discord incoming webhook, a custom FastAPI endpoint, another MCP
+tool's HTTP bridge, whatever you've got. This package has no opinion about the
+receiver; it just POSTs plain JSON and never blocks or fails the caller if the
+POST errors.
+
 ## Caveats
 
 - The usage endpoint is **undocumented** and can change or disappear without
