@@ -4,9 +4,20 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { request } from "./http.js";
-import { ClaudeApiUsageResponse, ClaudeCredentials } from "./types.js";
+import {
+  ClaudeApiUsageResponse,
+  ClaudeCredentials,
+  ClaudeProfileResponse,
+  SubscriptionInfo,
+} from "./types.js";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
+// The profile answer changes when a plan changes — not every five minutes. It
+// gets its own on-disk cache because the usage endpoint answers 429 to callers
+// that ask too often, and a phone polling every five minutes must not double
+// the request count just to learn a billing date it already knows.
+const PROFILE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
 const OAUTH_BETA = "oauth-2025-04-20";
 // Claude Code's public OAuth client id. The token endpoint rejects a refresh
@@ -200,5 +211,94 @@ export class ClaudeUsageClient {
       );
     }
     return JSON.parse(res.body) as ClaudeApiUsageResponse;
+  }
+
+  // ---- profile / subscription ---------------------------------------------
+
+  private get profileCachePath(): string {
+    return path.join(os.homedir(), ".cache", "claude-usage-mcp", "profile.json");
+  }
+
+  private readProfileCache(): SubscriptionInfo | null {
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.profileCachePath, "utf-8")) as {
+        at?: number;
+        subscription?: SubscriptionInfo;
+      };
+      if (!raw?.at || !raw.subscription) return null;
+      if (Date.now() - raw.at > PROFILE_CACHE_TTL_MS) return null;
+      return raw.subscription;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeProfileCache(subscription: SubscriptionInfo): void {
+    try {
+      fs.mkdirSync(path.dirname(this.profileCachePath), { recursive: true });
+      fs.writeFileSync(
+        this.profileCachePath,
+        JSON.stringify({ at: Date.now(), subscription }),
+        "utf-8",
+      );
+    } catch (e) {
+      log(`profile cache write failed: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Subscription facts (plan type, billing anniversary). Cached for a day.
+   *
+   * Returns `null` instead of throwing: a missing billing date is a missing
+   * line in a status bar, never a reason to lose the usage numbers that were
+   * fetched successfully alongside it.
+   */
+  async fetchSubscription(): Promise<SubscriptionInfo | null> {
+    const cached = this.readProfileCache();
+    if (cached) return cached;
+
+    const creds = await this.getValidCredentials();
+    if (!creds) return null;
+
+    try {
+      let res = await this.callProfileApi(creds.claudeAiOauth.accessToken);
+      if (res.status === 401) {
+        const refreshed = await this.refreshToken(creds);
+        res = await this.callProfileApi(refreshed.claudeAiOauth.accessToken);
+      }
+      if (res.status !== 200) {
+        log(`profile endpoint returned ${res.status}`);
+        return null;
+      }
+      const body = JSON.parse(res.body) as ClaudeProfileResponse;
+      const subscription: SubscriptionInfo = {
+        organizationType: body.organization?.organization_type ?? null,
+        billingType: body.organization?.billing_type ?? null,
+        status: body.organization?.subscription_status ?? null,
+        subscriptionCreatedAt: body.organization?.subscription_created_at ?? null,
+        hasMax: body.account?.has_claude_max ?? null,
+        hasPro: body.account?.has_claude_pro ?? null,
+      };
+      this.writeProfileCache(subscription);
+      return subscription;
+    } catch (e) {
+      log(`profile fetch failed: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  private callProfileApi(accessToken: string) {
+    return request(
+      PROFILE_URL,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "anthropic-beta": OAUTH_BETA,
+          "Content-Type": "application/json",
+        },
+      },
+      this.httpState,
+    );
   }
 }

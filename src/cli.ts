@@ -18,6 +18,13 @@ async function main() {
   try {
     const usage = await client.fetchUsage();
     const report = buildReport(usage);
+    // Subscription facts ride along only in the CLI: it is the entry point for
+    // callers that render a status line (voxterm's `voxterm-verbrauch`), and
+    // the answer comes from a second endpoint behind a day-long cache. A
+    // failure there is a missing field, never a failed report — hence the
+    // `null` check instead of a try/catch around the whole run.
+    const subscription = await client.fetchSubscription();
+    if (subscription) report.subscription = subscription;
     await maybeNotifyThreshold(report);
     process.stdout.write(JSON.stringify(report) + "\n");
     process.exit(0);

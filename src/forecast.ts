@@ -1,4 +1,10 @@
-import { ClaudeApiUsageResponse, ClaudeUsageLimit, WindowKey, WINDOW_HOURS } from "./types.js";
+import {
+  ClaudeApiUsageResponse,
+  ClaudeUsageLimit,
+  SubscriptionInfo,
+  WindowKey,
+  WINDOW_HOURS,
+} from "./types.js";
 
 // Reported velocity is clamped to this ceiling. 100 = keep current pace and
 // land exactly at the limit at reset. >100 means you have headroom; we cap at
@@ -110,9 +116,54 @@ export function computeForecast(
   };
 }
 
+/**
+ * A weekly quota that applies to **one model** (e.g. Fable), read out of the
+ * flat `limits` array rather than the named `seven_day_*` fields — on plans
+ * that scope by the array those fields come back `null` (see ClaudeLimitEntry).
+ */
+export interface ModelLimit {
+  /** Display name as the API spells it: "Fable", "Opus", ... */
+  model: string;
+  /** 0-100. */
+  utilization: number;
+  resetsAt: string | null;
+  /** Is this the limit currently being consumed? */
+  isActive: boolean;
+}
+
 export interface UsageReport {
   fetchedAt: string;
   windows: Partial<Record<"5h" | "weekly" | "weekly_opus", WindowForecast>>;
+  /** Model-scoped weekly quotas; empty when the plan has none. */
+  modelLimits?: ModelLimit[];
+  /** Subscription facts; only the CLI fills this in (extra endpoint, cached). */
+  subscription?: SubscriptionInfo;
+}
+
+/**
+ * Pull the model-scoped weekly limits out of the flat `limits` array.
+ *
+ * Deliberately keyed on `scope.model.display_name` and not on `kind`: the kind
+ * is `weekly_scoped` for every scoped limit, so it says *that* something is
+ * scoped, never *to what*. Entries without a model name are dropped — an
+ * unnamed percentage is not something a status bar can label.
+ */
+export function modelLimits(usage: ClaudeApiUsageResponse): ModelLimit[] {
+  const rows = usage.limits ?? [];
+  const out: ModelLimit[] = [];
+  for (const row of rows) {
+    const name = row?.scope?.model?.display_name;
+    if (!name) continue;
+    const percent = typeof row.percent === "number" ? row.percent : null;
+    if (percent == null || !Number.isFinite(percent)) continue;
+    out.push({
+      model: name,
+      utilization: round(percent),
+      resetsAt: row.resets_at ?? null,
+      isActive: row.is_active === true,
+    });
+  }
+  return out;
 }
 
 export function buildReport(usage: ClaudeApiUsageResponse, now: number = Date.now()): UsageReport {
@@ -121,5 +172,10 @@ export function buildReport(usage: ClaudeApiUsageResponse, now: number = Date.no
   if (usage.seven_day) windows["weekly"] = computeForecast(usage.seven_day, "seven_day", now);
   if (usage.seven_day_opus)
     windows["weekly_opus"] = computeForecast(usage.seven_day_opus, "seven_day_opus", now);
-  return { fetchedAt: new Date(now).toISOString(), windows };
+  const scoped = modelLimits(usage);
+  return {
+    fetchedAt: new Date(now).toISOString(),
+    windows,
+    ...(scoped.length > 0 ? { modelLimits: scoped } : {}),
+  };
 }
