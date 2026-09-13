@@ -1,7 +1,6 @@
 import {
   ClaudeApiUsageResponse,
   ClaudeUsageLimit,
-  SubscriptionInfo,
   WindowKey,
   WINDOW_HOURS,
 } from "./types.js";
@@ -136,8 +135,6 @@ export interface UsageReport {
   windows: Partial<Record<"5h" | "weekly" | "weekly_opus", WindowForecast>>;
   /** Model-scoped weekly quotas; empty when the plan has none. */
   modelLimits?: ModelLimit[];
-  /** Subscription facts; only the CLI fills this in (extra endpoint, cached). */
-  subscription?: SubscriptionInfo;
 }
 
 /**

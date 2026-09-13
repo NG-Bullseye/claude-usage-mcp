@@ -70,30 +70,3 @@ export interface ClaudeLimitEntry {
   is_active?: boolean | null;
 }
 
-/**
- * Subscription facts from `api/oauth/profile`. Separate endpoint, separate
- * cache: this changes when a plan changes, not every five minutes.
- *
- * There is **no "next renewal" field** in the payload. `subscriptionCreatedAt`
- * plus a monthly billing cycle is the only derivation available, and the
- * derivation is left to the caller so this stays a transport type.
- */
-export interface SubscriptionInfo {
-  organizationType?: string | null;
-  billingType?: string | null;
-  status?: string | null;
-  /** ISO timestamp the subscription started — the billing anniversary. */
-  subscriptionCreatedAt?: string | null;
-  hasMax?: boolean | null;
-  hasPro?: boolean | null;
-}
-
-export interface ClaudeProfileResponse {
-  account?: { has_claude_max?: boolean; has_claude_pro?: boolean } | null;
-  organization?: {
-    organization_type?: string | null;
-    billing_type?: string | null;
-    subscription_status?: string | null;
-    subscription_created_at?: string | null;
-  } | null;
-}
