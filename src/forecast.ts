@@ -123,6 +123,14 @@ export function computeForecast(
 export interface ModelLimit {
   /** Display name as the API spells it: "Fable", "Opus", ... */
   model: string;
+  /**
+   * The raw `kind` of the entry, e.g. `weekly_scoped`. Passed through rather
+   * than assumed: a caller that reads `resetsAt` to say *when the week rolls
+   * over* must be able to skip an entry that is scoped but not weekly. Today
+   * every scoped entry is `weekly_scoped`, and that is a measurement, not a
+   * guarantee — so the caller filters instead of trusting the shape.
+   */
+  kind: string | null;
   /** 0-100. */
   utilization: number;
   resetsAt: string | null;
@@ -155,6 +163,7 @@ export function modelLimits(usage: ClaudeApiUsageResponse): ModelLimit[] {
     if (percent == null || !Number.isFinite(percent)) continue;
     out.push({
       model: name,
+      kind: row.kind ?? null,
       utilization: round(percent),
       resetsAt: row.resets_at ?? null,
       isActive: row.is_active === true,
