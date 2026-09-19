@@ -81,15 +81,22 @@ Three kinds of entry are deliberately skipped:
 cannot decide it: no `message.model` in a real transcript carries the `[1m]`
 suffix, and a `model` attachment — which does — is written when a model is
 *selected*, so a switch later in a long session leaves a stale one looking
-current. But a prompt cannot exceed the window it was sent to, so any total
+current. But a prompt cannot exceed the window it was sent to, so a prompt
 above 200 000 proves a 1M session whatever the id says. The order is:
-`CLAUDE_CONTEXT_WINDOW` if set, then a `[1m]` suffix, then the observed total,
+`CLAUDE_CONTEXT_WINDOW` if set, then a `[1m]` suffix, then the observed prompt,
 then 200 000.
 
-The one case this leaves imprecise is a 1M session still under 200k tokens with
-no attachment to prove it: it is measured against 200 000, overstating how full
-it is. That error shrinks as the session grows and corrects itself the moment
-the total passes 200k — and it errs toward caution rather than false comfort.
+The *prompt* — `input + cacheCreation + cacheRead` — not the prompt plus the
+reply. Testing the sum would put a discontinuity exactly where it hurts: a
+session sitting at 97% of 200k would be re-read as 20% of 1M the moment one
+longer reply carried the sum over the line, turning "nearly full" into "plenty
+of room" as it filled up.
+
+Two consequences, both deliberately on the cautious side. A 1M session still
+under 200k with no attachment to prove it is measured against 200 000 and reads
+as fuller than it is; that corrects itself the moment the prompt passes 200k.
+And a 200k session whose reply carries the total just past the window reports
+100% with a total slightly above it — which is what being full looks like.
 
 **Right after a `/compact`** the newest turn on record predates the compaction
 and describes a context that no longer exists. When the compact boundary is
@@ -98,13 +105,18 @@ so the tool does not answer "100% used" to "did the compact work?". Such a
 report has a `total` but no token breakdown, which is visible from
 `compactedAt` being later than `lastMessageAt`.
 
-**`truncated`** is true when the transcript was too large to read whole. The
-token counts are unaffected — they come from the tail — but anything found by
-*scanning* may have been missed in the skipped middle, which is why
-`compactedAt` is only meaningful when `truncated` is false.
+**`truncated`** is true when the transcript was too large to read whole. Only
+a bounded head and tail are read, and the tail grows until it actually holds
+recent turns — a single transcript line can exceed a megabyte, and a fixed
+window landing inside one would otherwise leave the report quietly describing
+session start. Token counts are therefore sound; what a truncated read can miss
+is anything found by *scanning*, which is why `compactedAt` is only meaningful
+when `truncated` is false.
 
-**`lastTurnTokens`** is the growth since the previous turn. It goes negative
-across a `/compact`, which is the honest reading of what happened.
+**`lastTurnTokens`** is the growth since the previous turn, and goes negative
+across a `/compact`. It is `null` when the previous turn fell in the unread
+middle: head and tail are not consecutive, and diffing across the gap would
+measure the whole skipped stretch and call it one turn.
 
 ## The velocity recommendation (0–120%)
 
@@ -209,7 +221,9 @@ POST errors.
   transcript anywhere under `~/.claude/projects`. That is right in practice —
   the turn making the call was just written to that file — but two sessions
   sharing a working directory can be confused for one another. Pass
-  `session_id` when it matters.
+  `session_id` when it matters. Transcripts holding no turn at all are skipped
+  rather than failing the lookup: an idle session started later takes the top
+  of the mtime order without ever being the caller.
 - `sessionMatch` says which of those happened: `cwd` for the caller's own
   project folder, `explicit` when asked for by id or path, and `fallback` when
   the working directory had no folder of its own. A `fallback` report may

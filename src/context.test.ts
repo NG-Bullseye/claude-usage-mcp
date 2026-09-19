@@ -12,7 +12,7 @@ import {
   projectSlug,
   readContextReport,
   readTranscriptLines,
-  resolveTranscriptPath,
+  resolveTranscriptCandidates,
   tryReadContextReport,
 } from "./context.js";
 import { ContextReport } from "./types.js";
@@ -42,18 +42,32 @@ test("a non-numeric CLAUDE_CONTEXT_WINDOW is ignored", () => {
 // cannot have been sent to a 200k model, so the size itself settles it.
 
 test("a prompt larger than the default window proves a 1M session", () => {
-  assert.equal(contextWindowSizeFor("claude-opus-5", { observedTokens: 621_497 }), 1_000_000);
+  assert.equal(contextWindowSizeFor("claude-opus-5", { observedPrompt: 621_497 }), 1_000_000);
 });
 
 test("a prompt within the default window leaves it at 200k", () => {
-  assert.equal(contextWindowSizeFor("claude-opus-5", { observedTokens: 150_000 }), 200_000);
+  assert.equal(contextWindowSizeFor("claude-opus-5", { observedPrompt: 150_000 }), 200_000);
 });
 
 test("an explicit override still wins over the observed size", () => {
   assert.equal(
-    contextWindowSizeFor("claude-opus-5", { override: "300000", observedTokens: 621_497 }),
+    contextWindowSizeFor("claude-opus-5", { override: "300000", observedPrompt: 621_497 }),
     300_000,
   );
+});
+
+// Only the prompt is unambiguously bounded by the window. Adding the output
+// and testing that against 200 000 puts a cliff right in the danger zone: a
+// session at 97% of 200k would jump to 20% of 1M the moment a longer reply
+// pushed the sum past the line.
+
+test("output tokens do not push a full 200k session into the 1M bracket", () => {
+  const report = parseTranscript([
+    assistantLine({ cacheRead: 197_296, output: 2_997, model: "claude-opus-5" }),
+  ]);
+
+  assert.equal(report.contextWindowSize, 200_000);
+  assert.equal(report.utilization, 100);
 });
 
 // ---- parseTranscript -------------------------------------------------------
@@ -365,6 +379,17 @@ test("a compact older than the last turn leaves that turn's numbers alone", () =
   assert.equal(report.tokens.total, 40_000);
 });
 
+test("a turn with no timestamp is not overridden by an undatable boundary", () => {
+  const undated = JSON.stringify({
+    type: "assistant",
+    isSidechain: false,
+    message: { model: "claude-sonnet-5", usage: { cache_read_input_tokens: 150_000 } },
+  });
+  const report = parseTranscript([compactBoundaryLine("2026-09-19T10:05:00.000Z", 11_699), undated]);
+
+  assert.equal(report.tokens.total, 150_000);
+});
+
 test("a compact without postTokens cannot correct the turn, so it does not try", () => {
   const report = parseTranscript([
     assistantLine({ cacheRead: 190_000, timestamp: "2026-09-19T10:00:00.000Z" }),
@@ -438,7 +463,58 @@ test("a missing transcript raises ContextUnavailableError", (t) => {
   assert.throws(() => readTranscriptLines(file), ContextUnavailableError);
 });
 
-// ---- projectSlug / resolveTranscriptPath -----------------------------------
+// A single transcript line can be far larger than the tail budget — base64
+// screenshots and big tool results reach well over a megabyte. If such a line
+// is the last one, a fixed-size tail holds no complete turn at all, and the
+// report silently falls back to numbers from session start.
+
+test("the tail grows past a giant trailing line rather than reporting stale turns", (t) => {
+  const file = path.join(tempDir(t), "session.jsonl");
+  const giant = JSON.stringify({ type: "user", blob: "z".repeat(4_000) });
+  fs.writeFileSync(
+    file,
+    [
+      modelAttachmentLine("claude-opus-5"),
+      assistantLine({ cacheRead: 100_000 }),
+      assistantLine({ cacheRead: 150_000 }),
+      giant,
+    ].join("\n"),
+  );
+
+  const read = readTranscriptLines(file, { headBytes: 200, tailBytes: 500 });
+  const report = parseTranscript(read.lines, {
+    truncated: read.truncated,
+    contiguousFrom: read.contiguousFrom,
+  });
+
+  assert.equal(report.tokens.total, 150_000);
+  assert.equal(report.lastTurnTokens, 50_000);
+});
+
+// Head and tail are stitched together with a gap in between. Diffing the first
+// tail turn against the last head turn measures the whole skipped middle and
+// calls it one turn.
+
+test("the turn diff is not computed across the skipped middle", () => {
+  const report = parseTranscript(
+    [
+      assistantLine({ cacheRead: 5_000, messageId: "head" }),
+      assistantLine({ cacheRead: 160_000, messageId: "tail" }),
+    ],
+    { truncated: true, contiguousFrom: 1 },
+  );
+
+  assert.equal(report.tokens.total, 160_000);
+  assert.equal(report.lastTurnTokens, null);
+});
+
+test("an unknown turn cost is left out of the line rather than invented", () => {
+  const line = formatContextLine(reportFor({ lastTurnTokens: null }));
+
+  assert.match(line, /^context: 6% used \(64 802 \/ 1 000 000 tokens\)$/);
+});
+
+// ---- projectSlug / resolveTranscriptCandidates -----------------------------------
 
 test("a working directory maps to the project folder Claude Code writes to", () => {
   assert.equal(projectSlug("C:\\Users\\dev\\Documents"), "C--Users-dev-Documents");
@@ -473,7 +549,7 @@ test("the newest transcript of the working directory's own project wins", (t) =>
   seedTranscript(projectsDir, "C--other", "elsewhere", Date.now() + 60_000);
 
   assert.equal(
-    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo" }).path,
+    resolveTranscriptCandidates({ projectsDir, cwd: "C:\\work\\repo" }).paths[0],
     newest,
   );
 });
@@ -484,7 +560,7 @@ test("an unknown working directory falls back to the newest transcript anywhere"
   const newest = seedTranscript(projectsDir, "C--elsewhere", "new", Date.now());
 
   assert.equal(
-    resolveTranscriptPath({ projectsDir, cwd: "C:\\never\\indexed" }).path,
+    resolveTranscriptCandidates({ projectsDir, cwd: "C:\\never\\indexed" }).paths[0],
     newest,
   );
 });
@@ -493,13 +569,13 @@ test("how the transcript was found is reported, not just which one", (t) => {
   const projectsDir = tempDir(t);
   const own = seedTranscript(projectsDir, "C--work-repo", "own", Date.now());
 
-  assert.equal(resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo" }).match, "cwd");
+  assert.equal(resolveTranscriptCandidates({ projectsDir, cwd: "C:\\work\\repo" }).match, "cwd");
   assert.equal(
-    resolveTranscriptPath({ projectsDir, cwd: "C:\\never\\indexed" }).match,
+    resolveTranscriptCandidates({ projectsDir, cwd: "C:\\never\\indexed" }).match,
     "fallback",
   );
   assert.equal(
-    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo", transcriptPath: own }).match,
+    resolveTranscriptCandidates({ projectsDir, cwd: "C:\\work\\repo", transcriptPath: own }).match,
     "explicit",
   );
 });
@@ -510,7 +586,7 @@ test("an explicit transcript path is used as given", (t) => {
   const chosen = seedTranscript(projectsDir, "C--other", "chosen", Date.now() - 60_000);
 
   assert.equal(
-    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo", transcriptPath: chosen }).path,
+    resolveTranscriptCandidates({ projectsDir, cwd: "C:\\work\\repo", transcriptPath: chosen }).paths[0],
     chosen,
   );
 });
@@ -521,7 +597,7 @@ test("an explicit session id is found in any project folder", (t) => {
   const wanted = seedTranscript(projectsDir, "C--other", "sess-42", Date.now() - 60_000);
 
   assert.equal(
-    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo", sessionId: "sess-42" }).path,
+    resolveTranscriptCandidates({ projectsDir, cwd: "C:\\work\\repo", sessionId: "sess-42" }).paths[0],
     wanted,
   );
 });
@@ -531,7 +607,7 @@ test("an unknown session id raises ContextUnavailableError", (t) => {
   seedTranscript(projectsDir, "C--work-repo", "auto", Date.now());
 
   assert.throws(
-    () => resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo", sessionId: "ghost" }),
+    () => resolveTranscriptCandidates({ projectsDir, cwd: "C:\\work\\repo", sessionId: "ghost" }),
     ContextUnavailableError,
   );
 });
@@ -540,7 +616,7 @@ test("an empty projects folder raises ContextUnavailableError", (t) => {
   const projectsDir = tempDir(t);
 
   assert.throws(
-    () => resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo" }),
+    () => resolveTranscriptCandidates({ projectsDir, cwd: "C:\\work\\repo" }),
     ContextUnavailableError,
   );
 });
@@ -574,6 +650,25 @@ test("tryReadContextReport returns null instead of throwing when nothing is read
   const projectsDir = tempDir(t);
 
   assert.equal(tryReadContextReport({ projectsDir, cwd: "C:\\work\\repo" }), null);
+});
+
+// A transcript with no assistant turn is never the caller's own — the turn
+// that invoked this tool was appended before the tool ran. So an idle session
+// sitting at the top of the mtime order must not shadow the real one.
+
+test("an unusable newest transcript does not hide a usable sibling", (t) => {
+  const projectsDir = tempDir(t);
+  const dir = path.join(projectsDir, "C--work-repo");
+  fs.mkdirSync(dir, { recursive: true });
+  const older = path.join(dir, "real.jsonl");
+  fs.writeFileSync(older, assistantLine({ cacheRead: 40_000 }));
+  fs.utimesSync(older, Date.now() / 1000 - 60, Date.now() / 1000 - 60);
+  fs.writeFileSync(path.join(dir, "idle.jsonl"), JSON.stringify({ type: "user", text: "hi" }));
+
+  const report = readContextReport({ projectsDir, cwd: "C:\\work\\repo" });
+
+  assert.equal(report.transcriptPath, older);
+  assert.equal(report.tokens.total, 40_000);
 });
 
 test("the report says whether it is the caller's own session or a fallback", (t) => {

@@ -134,8 +134,12 @@ export interface ContextReport {
   model: string | null;
   contextWindowSize: number;
   tokens: ContextTokens;
-  /** Growth since the previous main-chain turn; negative right after a compact. */
-  lastTurnTokens: number;
+  /**
+   * Growth since the previous main-chain turn; negative right after a compact.
+   * Null when it cannot be known — a truncated read whose previous turn fell
+   * in the unread middle, where any number would be invented.
+   */
+  lastTurnTokens: number | null;
   /** 0-100, rounded. */
   utilization: number;
   remainingTokens: number;

@@ -21,6 +21,10 @@ import {
 const HEAD_BYTES = 128 * 1024;
 /** Bytes read from the end of a transcript: enough for the recent turns. */
 const TAIL_BYTES = 512 * 1024;
+/** How many transcripts to try before giving up on a folder. */
+const MAX_CANDIDATES = 5;
+/** Ceiling on growing the tail before settling for a single usable turn. */
+const MAX_TAIL_BYTES = 16 * 1024 * 1024;
 
 /** Context window of a model without the 1M beta, in tokens. */
 const DEFAULT_CONTEXT_WINDOW = 200_000;
@@ -38,17 +42,22 @@ const LONG_CONTEXT_WINDOW = 1_000_000;
  */
 export function contextWindowSizeFor(
   modelId: string | undefined,
-  opts: { override?: string; observedTokens?: number } = {},
+  opts: { override?: string; observedPrompt?: number } = {},
 ): number {
   const override = Number(opts.override);
   if (Number.isFinite(override) && override > 0) return override;
   if (modelId?.includes("[1m]")) return LONG_CONTEXT_WINDOW;
-  // A prompt cannot exceed the window it was sent to, so a total above the
+  // A prompt cannot exceed the window it was sent to, so a prompt above the
   // default settles the question that the model id cannot: no `message.model`
-  // in a real transcript ever carries the `[1m]` suffix, yet turns of 600k and
-  // more are ordinary. Without this the report clamps to "100% used, 0 left"
-  // on a session with most of a megatoken to spare.
-  if ((opts.observedTokens ?? 0) > DEFAULT_CONTEXT_WINDOW) return LONG_CONTEXT_WINDOW;
+  // in a real transcript ever carries the `[1m]` suffix, yet prompts of 600k
+  // and more are ordinary. Without this the report clamps to "100% used, 0
+  // left" on a session with most of a megatoken to spare.
+  //
+  // The *prompt*, not the prompt plus the reply. Testing the sum would put a
+  // discontinuity exactly where it hurts: a session at 97% of 200k would be
+  // re-read as 20% of 1M the moment one longer reply carried the sum over the
+  // line — turning "nearly full" into "plenty of room" as it filled up.
+  if ((opts.observedPrompt ?? 0) > DEFAULT_CONTEXT_WINDOW) return LONG_CONTEXT_WINDOW;
   return DEFAULT_CONTEXT_WINDOW;
 }
 
@@ -100,6 +109,11 @@ function postCompactTokens(total: number): ContextTokens {
   return { input: 0, cacheCreation: 0, cacheRead: 0, output: 0, total };
 }
 
+/** What was actually sent: the reply is generated, not part of the prompt. */
+function promptOf(tokens: ContextTokens): number {
+  return tokens.input + tokens.cacheCreation + tokens.cacheRead;
+}
+
 function sumUsage(usage: TranscriptUsage): ContextTokens {
   const input = usage.input_tokens ?? 0;
   const cacheCreation = usage.cache_creation_input_tokens ?? 0;
@@ -134,16 +148,25 @@ export function parseTranscript(
     contextWindowOverride?: string;
     truncated?: boolean;
     sessionMatch?: ContextReport["sessionMatch"];
+    /** Index at which the lines become contiguous again after a skipped gap. */
+    contiguousFrom?: number;
   } = {},
 ): Omit<ContextReport, "transcriptPath"> {
   let attachedModel: string | null = null;
   let compactedAt: string | undefined;
   let compactPostTokens: number | null = null;
-  let last: { entry: TranscriptEntry; tokens: ContextTokens } | null = null;
+  let last: { entry: TranscriptEntry; tokens: ContextTokens; index: number } | null = null;
   let lastCallId: string | null = null;
   let previousTotal: number | null = null;
 
-  for (const line of lines) {
+  // Head and tail are stitched together with a gap between them. Turns on
+  // opposite sides of it are not consecutive, and diffing them would measure
+  // the whole skipped middle and call it one turn.
+  const contiguousFrom = opts.contiguousFrom ?? 0;
+  const sameRun = (a: number, b: number) => a < contiguousFrom === (b < contiguousFrom);
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
     const entry = parseEntry(line);
     if (!entry || entry.isSidechain) continue;
 
@@ -171,9 +194,9 @@ export function parseTranscript(
     // previous total only moves when the call changes.
     const callId = entry.message?.id ?? null;
     if (!last || callId === null || callId !== lastCallId) {
-      previousTotal = last?.tokens.total ?? null;
+      previousTotal = last && sameRun(last.index, index) ? last.tokens.total : null;
     }
-    last = { entry, tokens };
+    last = { entry, tokens, index };
     lastCallId = callId;
   }
 
@@ -190,17 +213,21 @@ export function parseTranscript(
   // record predates the compaction and describes a context that is gone. The
   // boundary carries the size of the fresh one, so use it — otherwise the tool
   // answers "100% used" to the question "did the compact work?".
+  // A boundary is only known to be newer when both carry a timestamp. Without
+  // one there is nothing to compare, and the boundary may be days and several
+  // compactions old — picked up from the head of a truncated read.
   const tokens =
     compactedAt !== undefined &&
     compactPostTokens !== null &&
-    (lastMessageAt === null || compactedAt > lastMessageAt)
+    lastMessageAt !== null &&
+    compactedAt > lastMessageAt
       ? postCompactTokens(compactPostTokens)
       : last.tokens;
 
   const total = tokens.total;
   const contextWindowSize = contextWindowSizeFor(model ?? undefined, {
     override: opts.contextWindowOverride,
-    observedTokens: Math.max(total, last.tokens.total),
+    observedPrompt: promptOf(last.tokens),
   });
 
   return {
@@ -209,7 +236,15 @@ export function parseTranscript(
     model,
     contextWindowSize,
     tokens,
-    lastTurnTokens: previousTotal === null ? total : total - previousTotal,
+    // With no previous turn, the growth is the whole total — but only if we
+    // actually saw the start of the session. On a truncated read there is an
+    // earlier turn we simply did not read, and its cost is unknown, not zero.
+    lastTurnTokens:
+      previousTotal !== null
+        ? total - previousTotal
+        : opts.truncated
+          ? null
+          : total,
     utilization: Math.min(100, Math.round((total / contextWindowSize) * 100)),
     remainingTokens: Math.max(0, contextWindowSize - total),
     lastMessageAt,
@@ -234,7 +269,7 @@ export function parseTranscript(
 export function readTranscriptLines(
   filePath: string,
   opts: { headBytes?: number; tailBytes?: number } = {},
-): { lines: string[]; truncated: boolean } {
+): { lines: string[]; truncated: boolean; contiguousFrom: number } {
   const headBytes = opts.headBytes ?? HEAD_BYTES;
   const tailBytes = opts.tailBytes ?? TAIL_BYTES;
 
@@ -249,16 +284,47 @@ export function readTranscriptLines(
 
   try {
     const size = fs.fstatSync(fd).size;
-    if (size <= headBytes + tailBytes) {
-      return { lines: splitLines(readChunk(fd, 0, size)), truncated: false };
-    }
+    const whole = () => ({
+      lines: splitLines(readChunk(fd, 0, size)),
+      truncated: false,
+      contiguousFrom: 0,
+    });
+    if (size <= headBytes + tailBytes) return whole();
+
     // Drop the trailing partial line of the head and the leading one of the tail.
     const head = splitLines(readChunk(fd, 0, headBytes)).slice(0, -1);
-    const tail = splitLines(readChunk(fd, size - tailBytes, tailBytes)).slice(1);
-    return { lines: [...head, ...tail], truncated: true };
+
+    // A fixed tail is not enough. One transcript line can be larger than the
+    // whole budget — base64 screenshots and big tool results run past a
+    // megabyte — and if such a line is last, the tail holds no complete turn
+    // at all. The report would then fall back to a turn from the head, i.e.
+    // session start, and be quietly, plausibly wrong. So grow until the tail
+    // holds real turns.
+    for (let want = tailBytes; ; want *= 4) {
+      const from = size - want;
+      if (from <= 0) return whole();
+      const tail = splitLines(readChunk(fd, from, size - from)).slice(1);
+      const turns = countUsableTurns(tail);
+      if (turns >= 2 || (turns >= 1 && want >= MAX_TAIL_BYTES)) {
+        return { lines: [...head, ...tail], truncated: true, contiguousFrom: head.length };
+      }
+    }
   } finally {
     fs.closeSync(fd);
   }
+}
+
+/** Assistant turns in `lines` that carry real token counts. */
+function countUsableTurns(lines: string[]): number {
+  let n = 0;
+  for (const line of lines) {
+    if (!line.includes('"usage"')) continue;
+    const entry = parseEntry(line);
+    if (!entry || entry.isSidechain || entry.type !== "assistant") continue;
+    const usage = entry.message?.usage;
+    if (usage && sumUsage(usage).total > 0) n++;
+  }
+  return n;
 }
 
 function readChunk(fd: number, position: number, length: number): string {
@@ -306,17 +372,16 @@ function subdirectories(dir: string): string[] {
   }
 }
 
-function newest(files: string[]): string | null {
-  let best: { file: string; mtimeMs: number } | null = null;
+function newestFirst(files: string[]): string[] {
+  const dated: { file: string; mtimeMs: number }[] = [];
   for (const file of files) {
     try {
-      const { mtimeMs } = fs.statSync(file);
-      if (!best || mtimeMs > best.mtimeMs) best = { file, mtimeMs };
+      dated.push({ file, mtimeMs: fs.statSync(file).mtimeMs });
     } catch {
       // A transcript can be rotated away between readdir and stat; skip it.
     }
   }
-  return best?.file ?? null;
+  return dated.sort((a, b) => b.mtimeMs - a.mtimeMs).map((d) => d.file);
 }
 
 /**
@@ -332,15 +397,15 @@ function newest(files: string[]): string | null {
  *
  * @throws ContextUnavailableError when no transcript matches.
  */
-export function resolveTranscriptPath(
+export function resolveTranscriptCandidates(
   opts: {
     projectsDir?: string;
     cwd?: string;
     sessionId?: string;
     transcriptPath?: string;
   } = {},
-): { path: string; match: ContextReport["sessionMatch"] } {
-  if (opts.transcriptPath) return { path: opts.transcriptPath, match: "explicit" };
+): { paths: string[]; match: ContextReport["sessionMatch"] } {
+  if (opts.transcriptPath) return { paths: [opts.transcriptPath], match: "explicit" };
 
   const projectsDir = opts.projectsDir ?? defaultProjectsDir();
   const projectDirs = subdirectories(projectsDir);
@@ -349,7 +414,7 @@ export function resolveTranscriptPath(
     const wanted = `${opts.sessionId}.jsonl`;
     for (const dir of projectDirs) {
       const found = transcriptsIn(dir).find((f) => path.basename(f) === wanted);
-      if (found) return { path: found, match: "explicit" };
+      if (found) return { paths: [found], match: "explicit" };
     }
     throw new ContextUnavailableError(
       `No transcript found for session '${opts.sessionId}' under ${projectsDir}.`,
@@ -357,14 +422,14 @@ export function resolveTranscriptPath(
   }
 
   const cwd = opts.cwd ?? process.cwd();
-  const own = newest(transcriptsIn(path.join(projectsDir, projectSlug(cwd))));
-  if (own) return { path: own, match: "cwd" };
+  const own = newestFirst(transcriptsIn(path.join(projectsDir, projectSlug(cwd))));
+  if (own.length) return { paths: own.slice(0, MAX_CANDIDATES), match: "cwd" };
 
   // Nothing for this working directory. The freshest transcript on the machine
   // is a reasonable guess — but it is a guess, and it may belong to a wholly
   // unrelated project, so the caller is told which it got.
-  const anywhere = newest(projectDirs.flatMap(transcriptsIn));
-  if (anywhere) return { path: anywhere, match: "fallback" };
+  const anywhere = newestFirst(projectDirs.flatMap(transcriptsIn));
+  if (anywhere.length) return { paths: anywhere.slice(0, MAX_CANDIDATES), match: "fallback" };
 
   throw new ContextUnavailableError(
     `No session transcript found under ${projectsDir}.`,
@@ -393,14 +458,28 @@ export interface ContextLookupOptions {
  * @throws ContextUnavailableError when no transcript can be found or read.
  */
 export function readContextReport(opts: ContextLookupOptions = {}): ContextReport {
-  const { path: transcriptPath, match } = resolveTranscriptPath(opts);
-  const { lines, truncated } = readTranscriptLines(transcriptPath);
-  const parsed = parseTranscript(lines, {
-    contextWindowOverride: process.env.CLAUDE_CONTEXT_WINDOW,
-    truncated,
-    sessionMatch: match,
-  });
-  return { ...parsed, transcriptPath };
+  const { paths, match } = resolveTranscriptCandidates(opts);
+
+  // An idle session started later in the same folder takes the top of the
+  // mtime order without ever holding a turn. It is never the caller — the turn
+  // that invoked this tool was written before the tool ran — so walk past it
+  // rather than failing while the real transcript sits alongside.
+  let lastError: unknown;
+  for (const transcriptPath of paths) {
+    try {
+      const { lines, truncated, contiguousFrom } = readTranscriptLines(transcriptPath);
+      const parsed = parseTranscript(lines, {
+        contextWindowOverride: process.env.CLAUDE_CONTEXT_WINDOW,
+        truncated,
+        contiguousFrom,
+        sessionMatch: match,
+      });
+      return { ...parsed, transcriptPath };
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError ?? new ContextUnavailableError("No readable session transcript.");
 }
 
 /**
@@ -433,11 +512,14 @@ function groupThousands(value: number): string {
 /** The one-line summary shown at the top of a tool result. */
 export function formatContextLine(report: ContextReport): string {
   const { utilization, tokens, contextWindowSize, lastTurnTokens } = report;
-  const turn = (lastTurnTokens >= 0 ? "+" : "") + groupThousands(lastTurnTokens);
+  const turn =
+    lastTurnTokens === null
+      ? ""
+      : `, last turn ${lastTurnTokens >= 0 ? "+" : ""}${groupThousands(lastTurnTokens)}`;
   const line =
     `context: ${utilization}% used ` +
-    `(${groupThousands(tokens.total)} / ${groupThousands(contextWindowSize)} tokens), ` +
-    `last turn ${turn}`;
+    `(${groupThousands(tokens.total)} / ${groupThousands(contextWindowSize)} tokens)` +
+    turn;
   // Unlabelled, a fallback reads as the caller's own usage. It is not.
   return report.sessionMatch === "fallback"
     ? `${line} — warning: another session (${report.cwd ?? "unknown directory"})`
