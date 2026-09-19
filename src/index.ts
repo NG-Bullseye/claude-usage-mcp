@@ -4,6 +4,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { ClaudeUsageClient, UsageUnavailableError } from "./client.js";
+import {
+  ContextUnavailableError,
+  formatContextLine,
+  readContextReport,
+  tryReadContextReport,
+} from "./context.js";
 import { buildReport, computeForecast } from "./forecast.js";
 import { ALIAS_TO_KEY, WindowAlias } from "./types.js";
 import { maybeNotifyThreshold } from "./webhook.js";
@@ -11,7 +17,8 @@ import { maybeNotifyThreshold } from "./webhook.js";
 const client = new ClaudeUsageClient();
 
 function errorContent(e: unknown) {
-  const msg = e instanceof UsageUnavailableError ? e.message : `Unexpected error: ${(e as Error).message}`;
+  const known = e instanceof UsageUnavailableError || e instanceof ContextUnavailableError;
+  const msg = known ? e.message : `Unexpected error: ${(e as Error).message}`;
   return { content: [{ type: "text" as const, text: msg }], isError: true };
 }
 
@@ -44,10 +51,14 @@ server.registerTool(
             (f.exhaustAt ? `, would hit 100% at ${f.exhaustAt}` : ""),
         );
       }
+      // Best-effort garnish: the quota report stands on its own if the
+      // transcript cannot be read, so a context miss stays silent here.
+      const context = tryReadContextReport();
+      if (context) lines.push(formatContextLine(context));
       return {
         content: [
           { type: "text" as const, text: lines.join("\n") || "No usage windows returned." },
-          { type: "text" as const, text: JSON.stringify(report, null, 2) },
+          { type: "text" as const, text: JSON.stringify({ ...report, context }, null, 2) },
         ],
       };
     } catch (e) {
@@ -94,6 +105,52 @@ server.registerTool(
               `(${f.utilization}% used, forecast ${f.projectedEndUtilization}% at reset in ${f.remainingHours}h)`,
           },
           { type: "text" as const, text: JSON.stringify(f, null, 2) },
+        ],
+      };
+    } catch (e) {
+      return errorContent(e);
+    }
+  },
+);
+
+server.registerTool(
+  "get_context",
+  {
+    title: "Get context window usage",
+    description:
+      "How full the current session's context window is: percent used, tokens " +
+      "consumed and remaining, the window size (200k, or 1M on a [1m] model), and " +
+      "what the last turn added. This is session context, not subscription quota — " +
+      "use get_usage for quota. Read from the session transcript Claude Code writes " +
+      "on disk; the session is identified by the server's working directory, so pass " +
+      "session_id or transcript_path to read a different one.",
+    inputSchema: {
+      session_id: z
+        .string()
+        .optional()
+        .describe("Read this session instead of the one guessed from the working directory."),
+      transcript_path: z
+        .string()
+        .optional()
+        .describe("Absolute path of a transcript .jsonl to read instead of guessing."),
+    },
+  },
+  async ({
+    session_id,
+    transcript_path,
+  }: {
+    session_id?: string;
+    transcript_path?: string;
+  }) => {
+    try {
+      const report = readContextReport({
+        sessionId: session_id,
+        transcriptPath: transcript_path,
+      });
+      return {
+        content: [
+          { type: "text" as const, text: formatContextLine(report) },
+          { type: "text" as const, text: JSON.stringify(report, null, 2) },
         ],
       };
     } catch (e) {

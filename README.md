@@ -6,6 +6,9 @@ and a **velocity recommendation**. No API key required: it reuses the OAuth
 session that Claude Code already stores on your machine, exactly like Claude
 Code's own `/usage` command.
 
+It also reports **how full the current session's context window is**, read from
+the session transcript on disk — see [`get_context`](#get_context).
+
 ## How it works
 
 1. Reads Claude Code's OAuth credentials from `~/.claude/.credentials.json`
@@ -30,11 +33,45 @@ Code's own `/usage` command.
 No arguments. Returns every available window with:
 `utilization`, `resetsAt`, `remainingHours`, `projectedEndUtilization`
 (where you'd land at reset at the current pace), `exhaustAt` (when you'd hit
-100% if you will), and `velocityRecommendation`.
+100% if you will), and `velocityRecommendation`. A `context` line is appended
+when the session transcript is readable — see `get_context`.
 
 ### `get_velocity`
 Argument `window`: `"5h"`, `"weekly"`, or `"weekly_opus"`. Returns just the
 velocity recommendation and forecast for that one window.
+
+### `get_context`
+How full the **current session's context window** is — a different thing from
+subscription quota, which is what the two tools above report.
+
+```
+context: 6% used (64 802 / 1 000 000 tokens), last turn +3 052
+```
+
+Returns `utilization` (0–100), `tokens` (`input`, `cacheCreation`, `cacheRead`,
+`output`, `total`), `remainingTokens`, `contextWindowSize`, `model`,
+`lastTurnTokens`, plus the `sessionId`, `cwd` and `transcriptPath` the numbers
+came from, and `compactedAt` when the session has been compacted.
+
+Both arguments are optional and only needed to read a session other than the
+current one: `session_id`, or `transcript_path` for a transcript outside
+`~/.claude/projects`.
+
+**Where the numbers come from.** Claude Code hands its *status line* a
+ready-made `context_window` payload, but an MCP server never sees it. What the
+server can read is the session transcript at
+`~/.claude/projects/<slug>/<session-id>.jsonl`: the last main-chain `assistant`
+entry carries the `usage` counters of that API call, and their sum
+(`input + cache_creation + cache_read + output`) is what the context bar counts.
+Subagent turns (`isSidechain: true`) run in their own window and are skipped.
+
+**Window size.** 200 000 tokens, or 1 000 000 when the model id carries the
+`[1m]` suffix — which only the transcript's `model` attachment preserves, so
+that is what the server reads. Set `CLAUDE_CONTEXT_WINDOW` to override it for a
+model whose window cannot be inferred.
+
+**`lastTurnTokens`** is the growth since the previous turn. It goes negative
+across a `/compact`, which is the honest reading of what happened.
 
 ## The velocity recommendation (0–120%)
 
@@ -133,6 +170,16 @@ POST errors.
 - Velocity uses the *average* pace over the elapsed window (one snapshot per
   call). It's a guide, not a guarantee; a burst right before reset can still
   overshoot.
+- `get_context` **guesses which session is calling it**, because MCP servers are
+  told nothing about theirs. It takes the freshest transcript in the project
+  folder matching the server's working directory, falling back to the freshest
+  transcript anywhere under `~/.claude/projects`. That is right in practice —
+  the turn making the call was just written to that file — but two sessions
+  sharing a working directory can be confused for one another. Pass
+  `session_id` when it matters.
+- The transcript format is Claude Code's, not ours, and is undocumented. Only
+  a handful of fields are read, and `get_usage` degrades silently to its quota
+  numbers if any of this breaks.
 
 ## License
 

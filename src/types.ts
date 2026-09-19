@@ -70,3 +70,66 @@ export interface ClaudeLimitEntry {
   is_active?: boolean | null;
 }
 
+
+// ---- session transcript / context window -----------------------------------
+//
+// Claude Code appends one JSON object per line to
+// `~/.claude/projects/<slug>/<session-id>.jsonl`. Only a few entry kinds matter
+// for context accounting; these shapes cover just those fields, because the
+// format carries dozens more we have no business depending on.
+
+/** Token counters of a single API call, as the transcript records them. */
+export interface TranscriptUsage {
+  input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  output_tokens?: number | null;
+}
+
+/** The fields we read from any transcript line. */
+export interface TranscriptEntry {
+  type?: string | null;
+  /** `system` entries use this; `compact_boundary` marks a /compact. */
+  subtype?: string | null;
+  /** True for subagent turns, which run in their own context window. */
+  isSidechain?: boolean | null;
+  sessionId?: string | null;
+  cwd?: string | null;
+  timestamp?: string | null;
+  message?: { model?: string | null; usage?: TranscriptUsage | null } | null;
+  /** `type: "attachment"`; the `model` kind names the model actually in use. */
+  attachment?: {
+    type?: string | null;
+    identity?: { modelId?: string | null } | null;
+  } | null;
+}
+
+/** Token totals of the live context window. */
+export interface ContextTokens {
+  input: number;
+  cacheCreation: number;
+  cacheRead: number;
+  output: number;
+  /** What the context bar counts: every counter above, summed. */
+  total: number;
+}
+
+/** Context-window usage of one Claude Code session. */
+export interface ContextReport {
+  sessionId: string | null;
+  /** Absolute path of the transcript the numbers were read from. */
+  transcriptPath: string;
+  cwd: string | null;
+  /** Model id as Claude Code writes it, `[1m]` suffix included. */
+  model: string | null;
+  contextWindowSize: number;
+  tokens: ContextTokens;
+  /** Growth since the previous main-chain turn; negative right after a compact. */
+  lastTurnTokens: number;
+  /** 0-100, rounded. */
+  utilization: number;
+  remainingTokens: number;
+  lastMessageAt: string | null;
+  /** Timestamp of the last /compact, when the session had one. */
+  compactedAt?: string;
+}
