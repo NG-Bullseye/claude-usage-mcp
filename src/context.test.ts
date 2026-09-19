@@ -46,6 +46,7 @@ function assistantLine(opts: {
   input?: number;
   cacheCreation?: number;
   model?: string;
+  messageId?: string;
   isSidechain?: boolean;
   timestamp?: string;
 }): string {
@@ -53,9 +54,10 @@ function assistantLine(opts: {
     type: "assistant",
     isSidechain: opts.isSidechain ?? false,
     sessionId: "sess-1",
-    cwd: "C:\work\repo",
+    cwd: "C:\\work\\repo",
     timestamp: opts.timestamp ?? "2026-09-19T10:00:00.000Z",
     message: {
+      id: opts.messageId,
       model: opts.model ?? "claude-sonnet-5",
       usage: {
         input_tokens: opts.input ?? 0,
@@ -157,7 +159,7 @@ test("session id, cwd and the last message timestamp are carried through", () =>
   ]);
 
   assert.equal(report.sessionId, "sess-1");
-  assert.equal(report.cwd, "C:\work\repo");
+  assert.equal(report.cwd, "C:\\work\\repo");
   assert.equal(report.lastMessageAt, "2026-09-19T11:22:33.000Z");
 });
 
@@ -199,6 +201,94 @@ test("a transcript with no assistant usage raises ContextUnavailableError", () =
   );
 });
 
+// A model attachment can be stale: it is written when the model is *selected*,
+// so a switch recorded in the part of a large transcript we never read leaves
+// the session-start attachment as the newest one we can see. Believing it
+// silently sizes the window against the wrong model.
+
+test("an attachment naming a different model than the last turn is not believed", () => {
+  const report = parseTranscript([
+    modelAttachmentLine("claude-opus-5[1m]"),
+    assistantLine({ cacheRead: 180_000, model: "claude-fable-5-1" }),
+  ]);
+
+  assert.equal(report.model, "claude-fable-5-1");
+  assert.equal(report.contextWindowSize, 200_000);
+  assert.equal(report.utilization, 90);
+});
+
+test("an attachment for the same model still supplies the [1m] suffix", () => {
+  const report = parseTranscript([
+    modelAttachmentLine("claude-opus-5[1m]"),
+    assistantLine({ cacheRead: 50_000, model: "claude-opus-5" }),
+  ]);
+
+  assert.equal(report.model, "claude-opus-5[1m]");
+  assert.equal(report.contextWindowSize, 1_000_000);
+});
+
+// Claude Code writes one assistant entry per content block — thinking, text
+// and each tool_use — all carrying the same `usage`, because they came from one
+// API call. Diffing consecutive *entries* therefore reports a turn cost of 0.
+
+test("entries of one API call share a message id and count as a single turn", () => {
+  const report = parseTranscript([
+    assistantLine({ cacheRead: 10_000, messageId: "msg_a" }),
+    assistantLine({ cacheRead: 30_000, messageId: "msg_b" }),
+    assistantLine({ cacheRead: 30_000, messageId: "msg_b" }),
+  ]);
+
+  assert.equal(report.tokens.total, 30_000);
+  assert.equal(report.lastTurnTokens, 20_000);
+});
+
+test("entries without a message id still fall back to diffing consecutive turns", () => {
+  const report = parseTranscript([
+    assistantLine({ cacheRead: 10_000 }),
+    assistantLine({ cacheRead: 30_000 }),
+  ]);
+
+  assert.equal(report.lastTurnTokens, 20_000);
+});
+
+// Claude Code also writes synthetic assistant entries ("No response requested.")
+// whose usage counters are all zero. Read as the live context they claim an
+// empty window on a session that is nearly full.
+
+test("a synthetic zero-usage entry does not become the live context", () => {
+  const report = parseTranscript([
+    assistantLine({ cacheRead: 190_000, messageId: "msg_a" }),
+    assistantLine({ cacheRead: 0, model: "<synthetic>", messageId: "msg_b" }),
+  ]);
+
+  assert.equal(report.tokens.total, 190_000);
+  assert.equal(report.model, "claude-sonnet-5");
+});
+
+test("a transcript of nothing but zero-usage entries raises ContextUnavailableError", () => {
+  assert.throws(
+    () => parseTranscript([assistantLine({ cacheRead: 0 })]),
+    ContextUnavailableError,
+  );
+});
+
+// Whether the whole transcript was read decides what absence means: no compact
+// boundary in a complete read means the session was never compacted, but in a
+// truncated read it means we cannot tell.
+
+test("a complete read reports the transcript as untruncated", () => {
+  const report = parseTranscript([assistantLine({ cacheRead: 10_000 })], { truncated: false });
+
+  assert.equal(report.truncated, false);
+});
+
+test("a truncated read is flagged, so an absent compactedAt is not read as 'never'", () => {
+  const report = parseTranscript([assistantLine({ cacheRead: 10_000 })], { truncated: true });
+
+  assert.equal(report.truncated, true);
+  assert.equal(report.compactedAt, undefined);
+});
+
 // ---- readTranscriptLines ---------------------------------------------------
 
 /** A real temp directory, removed when the test ends. */
@@ -215,7 +305,10 @@ test("a small transcript is read whole", (t) => {
     [modelAttachmentLine("claude-opus-5[1m]"), assistantLine({ cacheRead: 10_000 })].join("\n"),
   );
 
-  assert.equal(readTranscriptLines(file).length, 2);
+  const read = readTranscriptLines(file);
+
+  assert.equal(read.lines.length, 2);
+  assert.equal(read.truncated, false);
 });
 
 test("an oversized transcript still yields the head model and the tail usage", (t) => {
@@ -228,13 +321,15 @@ test("an oversized transcript still yields the head model and the tail usage", (
     [
       modelAttachmentLine("claude-opus-5[1m]"),
       ...filler,
-      assistantLine({ cacheRead: 40_000 }),
-      assistantLine({ cacheRead: 50_000 }),
+      assistantLine({ cacheRead: 40_000, model: "claude-opus-5" }),
+      assistantLine({ cacheRead: 50_000, model: "claude-opus-5" }),
     ].join("\n"),
   );
 
-  const report = parseTranscript(readTranscriptLines(file, { headBytes: 400, tailBytes: 600 }));
+  const read = readTranscriptLines(file, { headBytes: 400, tailBytes: 600 });
+  const report = parseTranscript(read.lines, { truncated: read.truncated });
 
+  assert.equal(read.truncated, true);
   assert.equal(report.model, "claude-opus-5[1m]");
   assert.equal(report.tokens.total, 50_000);
   assert.equal(report.lastTurnTokens, 10_000);
@@ -247,7 +342,7 @@ test("the lines truncated by the read budget are dropped, never half-parsed", (t
   );
   fs.writeFileSync(file, lines.join("\n"));
 
-  for (const line of readTranscriptLines(file, { headBytes: 350, tailBytes: 350 })) {
+  for (const line of readTranscriptLines(file, { headBytes: 350, tailBytes: 350 }).lines) {
     assert.doesNotThrow(() => JSON.parse(line), `not valid JSON: ${line}`);
   }
 });
@@ -361,8 +456,8 @@ test("the report reads the live session end to end and names its transcript", (t
     file,
     [
       modelAttachmentLine("claude-opus-5[1m]"),
-      assistantLine({ cacheRead: 30_000 }),
-      assistantLine({ cacheRead: 50_000 }),
+      assistantLine({ cacheRead: 30_000, model: "claude-opus-5" }),
+      assistantLine({ cacheRead: 50_000, model: "claude-opus-5" }),
     ].join("\n"),
   );
 
@@ -396,6 +491,7 @@ function reportFor(overrides: Partial<ContextReport>): ContextReport {
     utilization: 6,
     remainingTokens: 935_198,
     lastMessageAt: "2026-09-19T10:00:00.000Z",
+    truncated: false,
     ...overrides,
   };
 }

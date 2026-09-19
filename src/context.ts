@@ -58,6 +58,33 @@ function parseEntry(line: string): TranscriptEntry | null {
   }
 }
 
+/** A model id without its variant suffix: `claude-opus-5[1m]` → `claude-opus-5`. */
+function baseModelId(modelId: string): string {
+  return modelId.replace(/\[[^\]]*\]$/, "");
+}
+
+/**
+ * Decide which model the last turn actually ran on.
+ *
+ * Neither source is sufficient alone. `message.model` is recorded by the turn
+ * itself, so it is never stale, but it drops the `[1m]` suffix — the one thing
+ * that separates a 1M window from a 200k one. The attachment keeps the suffix
+ * but is written when a model is *selected*, so on a long transcript, where
+ * only the head and tail are read, a switch in the skipped middle leaves the
+ * session-start attachment looking current.
+ *
+ * So the attachment is believed only when it agrees with the turn about which
+ * model ran; otherwise it is stale and the turn wins. Getting this wrong is
+ * not cosmetic: a session that switched from a `[1m]` model to a 200k one
+ * would otherwise be measured against five times the window it has, and
+ * reported as comfortable while effectively full.
+ */
+function resolveModel(attached: string | null, ofTurn: string | null): string | null {
+  if (!attached) return ofTurn;
+  if (!ofTurn) return attached;
+  return baseModelId(attached) === ofTurn ? attached : ofTurn;
+}
+
 function sumUsage(usage: TranscriptUsage): ContextTokens {
   const input = usage.input_tokens ?? 0;
   const cacheCreation = usage.cache_creation_input_tokens ?? 0;
@@ -88,16 +115,17 @@ function sumUsage(usage: TranscriptUsage): ContextTokens {
  */
 export function parseTranscript(
   lines: string[],
-  opts: { contextWindowOverride?: string } = {},
+  opts: { contextWindowOverride?: string; truncated?: boolean } = {},
 ): Omit<ContextReport, "transcriptPath"> {
   let attachedModel: string | null = null;
   let compactedAt: string | undefined;
   let last: { entry: TranscriptEntry; tokens: ContextTokens } | null = null;
+  let lastCallId: string | null = null;
   let previousTotal: number | null = null;
 
   for (const line of lines) {
     const entry = parseEntry(line);
-    if (!entry) continue;
+    if (!entry || entry.isSidechain) continue;
 
     if (entry.attachment?.type === "model" && entry.attachment.identity?.modelId) {
       attachedModel = entry.attachment.identity.modelId;
@@ -107,13 +135,25 @@ export function parseTranscript(
       compactedAt = entry.timestamp;
       continue;
     }
-    if (entry.type !== "assistant" || entry.isSidechain) continue;
+    if (entry.type !== "assistant") continue;
 
     const usage = entry.message?.usage;
     if (!usage) continue;
 
-    previousTotal = last?.tokens.total ?? null;
-    last = { entry, tokens: sumUsage(usage) };
+    const tokens = sumUsage(usage);
+    // Synthetic entries ("No response requested.") carry an all-zero usage.
+    // Taken for the live context they report an empty window on a full session.
+    if (tokens.total === 0) continue;
+
+    // One API call, several entries — thinking, text, each tool_use — all
+    // repeating the same id and usage. They are one turn, not several, so the
+    // previous total only moves when the call changes.
+    const callId = entry.message?.id ?? null;
+    if (!last || callId === null || callId !== lastCallId) {
+      previousTotal = last?.tokens.total ?? null;
+    }
+    last = { entry, tokens };
+    lastCallId = callId;
   }
 
   if (!last) {
@@ -122,9 +162,7 @@ export function parseTranscript(
     );
   }
 
-  // The attachment is authoritative: `message.model` drops the `[1m]` suffix,
-  // which is the one thing that tells a 1M window from a 200k one.
-  const model = attachedModel ?? last.entry.message?.model ?? null;
+  const model = resolveModel(attachedModel, last.entry.message?.model ?? null);
   const contextWindowSize = contextWindowSizeFor(model ?? undefined, {
     override: opts.contextWindowOverride,
   });
@@ -141,6 +179,7 @@ export function parseTranscript(
     remainingTokens: Math.max(0, contextWindowSize - total),
     lastMessageAt: last.entry.timestamp ?? null,
     compactedAt,
+    truncated: opts.truncated ?? false,
   };
 }
 
@@ -159,7 +198,7 @@ export function parseTranscript(
 export function readTranscriptLines(
   filePath: string,
   opts: { headBytes?: number; tailBytes?: number } = {},
-): string[] {
+): { lines: string[]; truncated: boolean } {
   const headBytes = opts.headBytes ?? HEAD_BYTES;
   const tailBytes = opts.tailBytes ?? TAIL_BYTES;
 
@@ -175,12 +214,12 @@ export function readTranscriptLines(
   try {
     const size = fs.fstatSync(fd).size;
     if (size <= headBytes + tailBytes) {
-      return splitLines(readChunk(fd, 0, size));
+      return { lines: splitLines(readChunk(fd, 0, size)), truncated: false };
     }
     // Drop the trailing partial line of the head and the leading one of the tail.
     const head = splitLines(readChunk(fd, 0, headBytes)).slice(0, -1);
     const tail = splitLines(readChunk(fd, size - tailBytes, tailBytes)).slice(1);
-    return [...head, ...tail];
+    return { lines: [...head, ...tail], truncated: true };
   } finally {
     fs.closeSync(fd);
   }
@@ -316,8 +355,10 @@ export interface ContextLookupOptions {
  */
 export function readContextReport(opts: ContextLookupOptions = {}): ContextReport {
   const transcriptPath = resolveTranscriptPath(opts);
-  const parsed = parseTranscript(readTranscriptLines(transcriptPath), {
+  const { lines, truncated } = readTranscriptLines(transcriptPath);
+  const parsed = parseTranscript(lines, {
     contextWindowOverride: process.env.CLAUDE_CONTEXT_WINDOW,
+    truncated,
   });
   return { ...parsed, transcriptPath };
 }

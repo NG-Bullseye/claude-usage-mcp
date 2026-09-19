@@ -96,7 +96,15 @@ export interface TranscriptEntry {
   sessionId?: string | null;
   cwd?: string | null;
   timestamp?: string | null;
-  message?: { model?: string | null; usage?: TranscriptUsage | null } | null;
+  /**
+   * One API call produces several assistant entries — thinking, text, each
+   * tool_use — and every one repeats the same `id` and the same `usage`.
+   */
+  message?: {
+    id?: string | null;
+    model?: string | null;
+    usage?: TranscriptUsage | null;
+  } | null;
   /** `type: "attachment"`; the `model` kind names the model actually in use. */
   attachment?: {
     type?: string | null;
@@ -130,6 +138,16 @@ export interface ContextReport {
   utilization: number;
   remainingTokens: number;
   lastMessageAt: string | null;
-  /** Timestamp of the last /compact, when the session had one. */
+  /**
+   * Timestamp of the last /compact seen. Meaningful only when `truncated` is
+   * false: a bounded read can step over a boundary in the middle of a long
+   * transcript, and absence would then be indistinguishable from "never".
+   */
   compactedAt?: string;
+  /**
+   * True when only part of the transcript was read, so anything derived from
+   * *scanning* it — `compactedAt`, and which model attachment is newest — may
+   * be missing evidence from the skipped middle.
+   */
+  truncated: boolean;
 }

@@ -51,7 +51,8 @@ context: 6% used (64 802 / 1 000 000 tokens), last turn +3 052
 Returns `utilization` (0–100), `tokens` (`input`, `cacheCreation`, `cacheRead`,
 `output`, `total`), `remainingTokens`, `contextWindowSize`, `model`,
 `lastTurnTokens`, plus the `sessionId`, `cwd` and `transcriptPath` the numbers
-came from, and `compactedAt` when the session has been compacted.
+came from, `compactedAt` when the session has been compacted, and `truncated`
+(see below).
 
 Both arguments are optional and only needed to read a session other than the
 current one: `session_id`, or `transcript_path` for a transcript outside
@@ -63,12 +64,29 @@ server can read is the session transcript at
 `~/.claude/projects/<slug>/<session-id>.jsonl`: the last main-chain `assistant`
 entry carries the `usage` counters of that API call, and their sum
 (`input + cache_creation + cache_read + output`) is what the context bar counts.
-Subagent turns (`isSidechain: true`) run in their own window and are skipped.
+Three kinds of entry are deliberately skipped:
+
+- **Subagent turns** (`isSidechain: true`) run in their own window.
+- **Synthetic entries** ("No response requested.") whose counters are all zero;
+  read as the live context they claim an empty window on a full session.
+- **Repeat entries of one API call** — Claude Code writes one entry per content
+  block (thinking, text, each `tool_use`), all sharing a `message.id` and the
+  same `usage`. They are one turn, so `lastTurnTokens` diffs against the
+  previous *call*, not the previous line.
 
 **Window size.** 200 000 tokens, or 1 000 000 when the model id carries the
-`[1m]` suffix — which only the transcript's `model` attachment preserves, so
-that is what the server reads. Set `CLAUDE_CONTEXT_WINDOW` to override it for a
-model whose window cannot be inferred.
+`[1m]` suffix. Neither source in the transcript is sufficient alone:
+`message.model` is written by the turn itself so it is never stale, but it drops
+the suffix; the `model` attachment keeps the suffix but is written when a model
+is *selected*, so a switch made later in a long session can leave a stale one
+looking current. The attachment is therefore believed only when it names the
+same model as the last turn. Set `CLAUDE_CONTEXT_WINDOW` to override the result
+for a model whose window cannot be inferred.
+
+**`truncated`** is true when the transcript was too large to read whole. The
+token counts are unaffected — they come from the tail — but anything found by
+*scanning* may have been missed in the skipped middle, which is why
+`compactedAt` is only meaningful when `truncated` is false.
 
 **`lastTurnTokens`** is the growth since the previous turn. It goes negative
 across a `/compact`, which is the honest reading of what happened.
