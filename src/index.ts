@@ -52,8 +52,10 @@ server.registerTool(
         );
       }
       // Best-effort garnish: the quota report stands on its own if the
-      // transcript cannot be read, so a context miss stays silent here.
-      const context = tryReadContextReport();
+      // transcript cannot be read, so a context miss stays silent here — and
+      // `ownSessionOnly` keeps an unrelated project's session from being
+      // appended, unasked, as though it were the caller's.
+      const context = tryReadContextReport({ ownSessionOnly: true });
       if (context) lines.push(formatContextLine(context));
       return {
         content: [

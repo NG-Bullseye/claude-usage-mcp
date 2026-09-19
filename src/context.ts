@@ -38,11 +38,18 @@ const LONG_CONTEXT_WINDOW = 1_000_000;
  */
 export function contextWindowSizeFor(
   modelId: string | undefined,
-  opts: { override?: string } = {},
+  opts: { override?: string; observedTokens?: number } = {},
 ): number {
   const override = Number(opts.override);
   if (Number.isFinite(override) && override > 0) return override;
-  return modelId?.includes("[1m]") ? LONG_CONTEXT_WINDOW : DEFAULT_CONTEXT_WINDOW;
+  if (modelId?.includes("[1m]")) return LONG_CONTEXT_WINDOW;
+  // A prompt cannot exceed the window it was sent to, so a total above the
+  // default settles the question that the model id cannot: no `message.model`
+  // in a real transcript ever carries the `[1m]` suffix, yet turns of 600k and
+  // more are ordinary. Without this the report clamps to "100% used, 0 left"
+  // on a session with most of a megatoken to spare.
+  if ((opts.observedTokens ?? 0) > DEFAULT_CONTEXT_WINDOW) return LONG_CONTEXT_WINDOW;
+  return DEFAULT_CONTEXT_WINDOW;
 }
 
 export class ContextUnavailableError extends Error {}
@@ -85,6 +92,14 @@ function resolveModel(attached: string | null, ofTurn: string | null): string | 
   return baseModelId(attached) === ofTurn ? attached : ofTurn;
 }
 
+/**
+ * Tokens as a compact boundary reports them: a total with no breakdown, since
+ * the boundary records the size of the new context and not how it splits.
+ */
+function postCompactTokens(total: number): ContextTokens {
+  return { input: 0, cacheCreation: 0, cacheRead: 0, output: 0, total };
+}
+
 function sumUsage(usage: TranscriptUsage): ContextTokens {
   const input = usage.input_tokens ?? 0;
   const cacheCreation = usage.cache_creation_input_tokens ?? 0;
@@ -115,10 +130,15 @@ function sumUsage(usage: TranscriptUsage): ContextTokens {
  */
 export function parseTranscript(
   lines: string[],
-  opts: { contextWindowOverride?: string; truncated?: boolean } = {},
+  opts: {
+    contextWindowOverride?: string;
+    truncated?: boolean;
+    sessionMatch?: ContextReport["sessionMatch"];
+  } = {},
 ): Omit<ContextReport, "transcriptPath"> {
   let attachedModel: string | null = null;
   let compactedAt: string | undefined;
+  let compactPostTokens: number | null = null;
   let last: { entry: TranscriptEntry; tokens: ContextTokens } | null = null;
   let lastCallId: string | null = null;
   let previousTotal: number | null = null;
@@ -133,6 +153,7 @@ export function parseTranscript(
     }
     if (entry.subtype === "compact_boundary" && entry.timestamp) {
       compactedAt = entry.timestamp;
+      compactPostTokens = entry.compactMetadata?.postTokens ?? null;
       continue;
     }
     if (entry.type !== "assistant") continue;
@@ -163,23 +184,38 @@ export function parseTranscript(
   }
 
   const model = resolveModel(attachedModel, last.entry.message?.model ?? null);
+  const lastMessageAt = last.entry.timestamp ?? null;
+
+  // Between running /compact and the next assistant turn, the newest turn on
+  // record predates the compaction and describes a context that is gone. The
+  // boundary carries the size of the fresh one, so use it — otherwise the tool
+  // answers "100% used" to the question "did the compact work?".
+  const tokens =
+    compactedAt !== undefined &&
+    compactPostTokens !== null &&
+    (lastMessageAt === null || compactedAt > lastMessageAt)
+      ? postCompactTokens(compactPostTokens)
+      : last.tokens;
+
+  const total = tokens.total;
   const contextWindowSize = contextWindowSizeFor(model ?? undefined, {
     override: opts.contextWindowOverride,
+    observedTokens: Math.max(total, last.tokens.total),
   });
-  const total = last.tokens.total;
 
   return {
     sessionId: last.entry.sessionId ?? null,
     cwd: last.entry.cwd ?? null,
     model,
     contextWindowSize,
-    tokens: last.tokens,
+    tokens,
     lastTurnTokens: previousTotal === null ? total : total - previousTotal,
     utilization: Math.min(100, Math.round((total / contextWindowSize) * 100)),
     remainingTokens: Math.max(0, contextWindowSize - total),
-    lastMessageAt: last.entry.timestamp ?? null,
+    lastMessageAt,
     compactedAt,
     truncated: opts.truncated ?? false,
+    sessionMatch: opts.sessionMatch ?? "cwd",
   };
 }
 
@@ -303,8 +339,8 @@ export function resolveTranscriptPath(
     sessionId?: string;
     transcriptPath?: string;
   } = {},
-): string {
-  if (opts.transcriptPath) return opts.transcriptPath;
+): { path: string; match: ContextReport["sessionMatch"] } {
+  if (opts.transcriptPath) return { path: opts.transcriptPath, match: "explicit" };
 
   const projectsDir = opts.projectsDir ?? defaultProjectsDir();
   const projectDirs = subdirectories(projectsDir);
@@ -312,8 +348,8 @@ export function resolveTranscriptPath(
   if (opts.sessionId) {
     const wanted = `${opts.sessionId}.jsonl`;
     for (const dir of projectDirs) {
-      const match = transcriptsIn(dir).find((f) => path.basename(f) === wanted);
-      if (match) return match;
+      const found = transcriptsIn(dir).find((f) => path.basename(f) === wanted);
+      if (found) return { path: found, match: "explicit" };
     }
     throw new ContextUnavailableError(
       `No transcript found for session '${opts.sessionId}' under ${projectsDir}.`,
@@ -322,10 +358,13 @@ export function resolveTranscriptPath(
 
   const cwd = opts.cwd ?? process.cwd();
   const own = newest(transcriptsIn(path.join(projectsDir, projectSlug(cwd))));
-  if (own) return own;
+  if (own) return { path: own, match: "cwd" };
 
+  // Nothing for this working directory. The freshest transcript on the machine
+  // is a reasonable guess — but it is a guess, and it may belong to a wholly
+  // unrelated project, so the caller is told which it got.
   const anywhere = newest(projectDirs.flatMap(transcriptsIn));
-  if (anywhere) return anywhere;
+  if (anywhere) return { path: anywhere, match: "fallback" };
 
   throw new ContextUnavailableError(
     `No session transcript found under ${projectsDir}.`,
@@ -354,11 +393,12 @@ export interface ContextLookupOptions {
  * @throws ContextUnavailableError when no transcript can be found or read.
  */
 export function readContextReport(opts: ContextLookupOptions = {}): ContextReport {
-  const transcriptPath = resolveTranscriptPath(opts);
+  const { path: transcriptPath, match } = resolveTranscriptPath(opts);
   const { lines, truncated } = readTranscriptLines(transcriptPath);
   const parsed = parseTranscript(lines, {
     contextWindowOverride: process.env.CLAUDE_CONTEXT_WINDOW,
     truncated,
+    sessionMatch: match,
   });
   return { ...parsed, transcriptPath };
 }
@@ -371,10 +411,14 @@ export function readContextReport(opts: ContextLookupOptions = {}): ContextRepor
  * down a report that is otherwise fine.
  */
 export function tryReadContextReport(
-  opts: ContextLookupOptions = {},
+  opts: ContextLookupOptions & { ownSessionOnly?: boolean } = {},
 ): ContextReport | null {
   try {
-    return readContextReport(opts);
+    const report = readContextReport(opts);
+    // A caller that appends this to some other answer, unasked, must not
+    // quietly describe a stranger's session. Saying nothing is the better miss.
+    if (opts.ownSessionOnly && report.sessionMatch === "fallback") return null;
+    return report;
   } catch {
     return null;
   }
@@ -390,9 +434,12 @@ function groupThousands(value: number): string {
 export function formatContextLine(report: ContextReport): string {
   const { utilization, tokens, contextWindowSize, lastTurnTokens } = report;
   const turn = (lastTurnTokens >= 0 ? "+" : "") + groupThousands(lastTurnTokens);
-  return (
+  const line =
     `context: ${utilization}% used ` +
     `(${groupThousands(tokens.total)} / ${groupThousands(contextWindowSize)} tokens), ` +
-    `last turn ${turn}`
-  );
+    `last turn ${turn}`;
+  // Unlabelled, a fallback reads as the caller's own usage. It is not.
+  return report.sessionMatch === "fallback"
+    ? `${line} — warning: another session (${report.cwd ?? "unknown directory"})`
+    : line;
 }

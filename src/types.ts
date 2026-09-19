@@ -91,6 +91,8 @@ export interface TranscriptEntry {
   type?: string | null;
   /** `system` entries use this; `compact_boundary` marks a /compact. */
   subtype?: string | null;
+  /** On a `compact_boundary`: `postTokens` is the size of the fresh context. */
+  compactMetadata?: { postTokens?: number | null } | null;
   /** True for subagent turns, which run in their own context window. */
   isSidechain?: boolean | null;
   sessionId?: string | null;
@@ -150,4 +152,11 @@ export interface ContextReport {
    * be missing evidence from the skipped middle.
    */
   truncated: boolean;
+  /**
+   * How the transcript was found. `cwd` is the caller's own project folder,
+   * `explicit` was asked for by id or path, and `fallback` means the working
+   * directory had no project folder and the freshest transcript on the machine
+   * was used — which may well belong to an unrelated session.
+   */
+  sessionMatch: "cwd" | "explicit" | "fallback";
 }

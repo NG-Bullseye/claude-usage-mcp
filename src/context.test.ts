@@ -37,6 +37,25 @@ test("a non-numeric CLAUDE_CONTEXT_WINDOW is ignored", () => {
   assert.equal(contextWindowSizeFor("claude-sonnet-5", { override: "lots" }), 200_000);
 });
 
+// No model id in a real transcript carries the `[1m]` suffix — `message.model`
+// never does — yet prompts well past 200k are common. A prompt that large
+// cannot have been sent to a 200k model, so the size itself settles it.
+
+test("a prompt larger than the default window proves a 1M session", () => {
+  assert.equal(contextWindowSizeFor("claude-opus-5", { observedTokens: 621_497 }), 1_000_000);
+});
+
+test("a prompt within the default window leaves it at 200k", () => {
+  assert.equal(contextWindowSizeFor("claude-opus-5", { observedTokens: 150_000 }), 200_000);
+});
+
+test("an explicit override still wins over the observed size", () => {
+  assert.equal(
+    contextWindowSizeFor("claude-opus-5", { override: "300000", observedTokens: 621_497 }),
+    300_000,
+  );
+});
+
 // ---- parseTranscript -------------------------------------------------------
 
 /** One assistant entry as Claude Code writes it, with only the fields we read. */
@@ -289,6 +308,72 @@ test("a truncated read is flagged, so an absent compactedAt is not read as 'neve
   assert.equal(report.compactedAt, undefined);
 });
 
+// A session whose turns outgrew 200k was necessarily running a 1M window,
+// whatever its model id says.
+
+test("a turn above the default window is measured against 1M, not clamped to 100%", () => {
+  const report = parseTranscript([
+    assistantLine({ cacheRead: 411_628, model: "claude-fable-5-1" }),
+  ]);
+
+  assert.equal(report.contextWindowSize, 1_000_000);
+  assert.equal(report.utilization, 41);
+  assert.equal(report.remainingTokens, 588_372);
+});
+
+test("a stale [1m] attachment no longer shrinks a session below its real size", () => {
+  const report = parseTranscript([
+    modelAttachmentLine("claude-opus-5[1m]"),
+    assistantLine({ cacheRead: 411_628, model: "claude-fable-5-1" }),
+  ]);
+
+  assert.equal(report.model, "claude-fable-5-1");
+  assert.equal(report.contextWindowSize, 1_000_000);
+  assert.equal(report.utilization, 41);
+});
+
+// Between running /compact and the next assistant turn, the newest turn on
+// record is the pre-compact one. Its totals describe a context that no longer
+// exists — and the boundary itself carries the answer.
+
+function compactBoundaryLine(timestamp: string, postTokens?: number): string {
+  return JSON.stringify({
+    type: "system",
+    subtype: "compact_boundary",
+    timestamp,
+    compactMetadata: postTokens === undefined ? {} : { postTokens },
+  });
+}
+
+test("a compact newer than the last turn reports the post-compact size", () => {
+  const report = parseTranscript([
+    assistantLine({ cacheRead: 190_000, timestamp: "2026-09-19T10:00:00.000Z" }),
+    compactBoundaryLine("2026-09-19T10:05:00.000Z", 11_699),
+  ]);
+
+  assert.equal(report.tokens.total, 11_699);
+  assert.equal(report.utilization, 6);
+  assert.equal(report.compactedAt, "2026-09-19T10:05:00.000Z");
+});
+
+test("a compact older than the last turn leaves that turn's numbers alone", () => {
+  const report = parseTranscript([
+    compactBoundaryLine("2026-09-19T10:00:00.000Z", 11_699),
+    assistantLine({ cacheRead: 40_000, timestamp: "2026-09-19T10:05:00.000Z" }),
+  ]);
+
+  assert.equal(report.tokens.total, 40_000);
+});
+
+test("a compact without postTokens cannot correct the turn, so it does not try", () => {
+  const report = parseTranscript([
+    assistantLine({ cacheRead: 190_000, timestamp: "2026-09-19T10:00:00.000Z" }),
+    compactBoundaryLine("2026-09-19T10:05:00.000Z"),
+  ]);
+
+  assert.equal(report.tokens.total, 190_000);
+});
+
 // ---- readTranscriptLines ---------------------------------------------------
 
 /** A real temp directory, removed when the test ends. */
@@ -388,7 +473,7 @@ test("the newest transcript of the working directory's own project wins", (t) =>
   seedTranscript(projectsDir, "C--other", "elsewhere", Date.now() + 60_000);
 
   assert.equal(
-    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo" }),
+    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo" }).path,
     newest,
   );
 });
@@ -399,8 +484,23 @@ test("an unknown working directory falls back to the newest transcript anywhere"
   const newest = seedTranscript(projectsDir, "C--elsewhere", "new", Date.now());
 
   assert.equal(
-    resolveTranscriptPath({ projectsDir, cwd: "C:\\never\\indexed" }),
+    resolveTranscriptPath({ projectsDir, cwd: "C:\\never\\indexed" }).path,
     newest,
+  );
+});
+
+test("how the transcript was found is reported, not just which one", (t) => {
+  const projectsDir = tempDir(t);
+  const own = seedTranscript(projectsDir, "C--work-repo", "own", Date.now());
+
+  assert.equal(resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo" }).match, "cwd");
+  assert.equal(
+    resolveTranscriptPath({ projectsDir, cwd: "C:\\never\\indexed" }).match,
+    "fallback",
+  );
+  assert.equal(
+    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo", transcriptPath: own }).match,
+    "explicit",
   );
 });
 
@@ -410,7 +510,7 @@ test("an explicit transcript path is used as given", (t) => {
   const chosen = seedTranscript(projectsDir, "C--other", "chosen", Date.now() - 60_000);
 
   assert.equal(
-    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo", transcriptPath: chosen }),
+    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo", transcriptPath: chosen }).path,
     chosen,
   );
 });
@@ -421,7 +521,7 @@ test("an explicit session id is found in any project folder", (t) => {
   const wanted = seedTranscript(projectsDir, "C--other", "sess-42", Date.now() - 60_000);
 
   assert.equal(
-    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo", sessionId: "sess-42" }),
+    resolveTranscriptPath({ projectsDir, cwd: "C:\\work\\repo", sessionId: "sess-42" }).path,
     wanted,
   );
 });
@@ -476,6 +576,48 @@ test("tryReadContextReport returns null instead of throwing when nothing is read
   assert.equal(tryReadContextReport({ projectsDir, cwd: "C:\\work\\repo" }), null);
 });
 
+test("the report says whether it is the caller's own session or a fallback", (t) => {
+  const projectsDir = tempDir(t);
+  const dir = path.join(projectsDir, "D--other-project");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "stranger.jsonl"), assistantLine({ cacheRead: 40_000 }));
+
+  const report = readContextReport({ projectsDir, cwd: "C:\\work\\repo" });
+
+  assert.equal(report.sessionMatch, "fallback");
+});
+
+// get_usage appends the context line without being asked for it. Quietly
+// describing some other project's session there would be worse than saying
+// nothing, so the silent path refuses a fallback.
+
+test("the silent garnish refuses a session that is not the caller's", (t) => {
+  const projectsDir = tempDir(t);
+  const dir = path.join(projectsDir, "D--other-project");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "stranger.jsonl"), assistantLine({ cacheRead: 40_000 }));
+
+  assert.equal(
+    tryReadContextReport({ projectsDir, cwd: "C:\\work\\repo", ownSessionOnly: true }),
+    null,
+  );
+});
+
+test("the silent garnish accepts the caller's own session", (t) => {
+  const projectsDir = tempDir(t);
+  const dir = path.join(projectsDir, "C--work-repo");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "own.jsonl"), assistantLine({ cacheRead: 40_000 }));
+
+  const report = tryReadContextReport({
+    projectsDir,
+    cwd: "C:\\work\\repo",
+    ownSessionOnly: true,
+  });
+
+  assert.equal(report?.sessionMatch, "cwd");
+});
+
 // ---- formatContextLine -----------------------------------------------------
 
 /** A report shaped like the real thing, with only the formatted fields set. */
@@ -492,6 +634,7 @@ function reportFor(overrides: Partial<ContextReport>): ContextReport {
     remainingTokens: 935_198,
     lastMessageAt: "2026-09-19T10:00:00.000Z",
     truncated: false,
+    sessionMatch: "cwd",
     ...overrides,
   };
 }
@@ -501,6 +644,12 @@ test("the context line groups thousands and states the window it is against", ()
     formatContextLine(reportFor({})),
     "context: 6% used (64 802 / 1 000 000 tokens), last turn +3 052",
   );
+});
+
+test("a fallback session is labelled, so its numbers are not read as the caller's", () => {
+  const line = formatContextLine(reportFor({ sessionMatch: "fallback" }));
+
+  assert.match(line, /another session/);
 });
 
 test("a turn that shrank the context keeps its negative sign", () => {

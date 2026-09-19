@@ -51,8 +51,8 @@ context: 6% used (64 802 / 1 000 000 tokens), last turn +3 052
 Returns `utilization` (0–100), `tokens` (`input`, `cacheCreation`, `cacheRead`,
 `output`, `total`), `remainingTokens`, `contextWindowSize`, `model`,
 `lastTurnTokens`, plus the `sessionId`, `cwd` and `transcriptPath` the numbers
-came from, `compactedAt` when the session has been compacted, and `truncated`
-(see below).
+came from, `compactedAt` when the session has been compacted, `truncated` and
+`sessionMatch` (both below).
 
 Both arguments are optional and only needed to read a session other than the
 current one: `session_id`, or `transcript_path` for a transcript outside
@@ -66,22 +66,37 @@ entry carries the `usage` counters of that API call, and their sum
 (`input + cache_creation + cache_read + output`) is what the context bar counts.
 Three kinds of entry are deliberately skipped:
 
-- **Subagent turns** (`isSidechain: true`) run in their own window.
 - **Synthetic entries** ("No response requested.") whose counters are all zero;
   read as the live context they claim an empty window on a full session.
 - **Repeat entries of one API call** — Claude Code writes one entry per content
   block (thinking, text, each `tool_use`), all sharing a `message.id` and the
   same `usage`. They are one turn, so `lastTurnTokens` diffs against the
   previous *call*, not the previous line.
+- **Subagent turns** (`isSidechain: true`). Today's Claude Code writes subagent
+  transcripts to a subfolder instead and never sets this flag, so the filter is
+  currently inert; it is kept because the field is part of the entry shape and
+  costs nothing to honour.
 
-**Window size.** 200 000 tokens, or 1 000 000 when the model id carries the
-`[1m]` suffix. Neither source in the transcript is sufficient alone:
-`message.model` is written by the turn itself so it is never stale, but it drops
-the suffix; the `model` attachment keeps the suffix but is written when a model
-is *selected*, so a switch made later in a long session can leave a stale one
-looking current. The attachment is therefore believed only when it names the
-same model as the last turn. Set `CLAUDE_CONTEXT_WINDOW` to override the result
-for a model whose window cannot be inferred.
+**Window size** is settled by arithmetic, not by the model id. The id alone
+cannot decide it: no `message.model` in a real transcript carries the `[1m]`
+suffix, and a `model` attachment — which does — is written when a model is
+*selected*, so a switch later in a long session leaves a stale one looking
+current. But a prompt cannot exceed the window it was sent to, so any total
+above 200 000 proves a 1M session whatever the id says. The order is:
+`CLAUDE_CONTEXT_WINDOW` if set, then a `[1m]` suffix, then the observed total,
+then 200 000.
+
+The one case this leaves imprecise is a 1M session still under 200k tokens with
+no attachment to prove it: it is measured against 200 000, overstating how full
+it is. That error shrinks as the session grows and corrects itself the moment
+the total passes 200k — and it errs toward caution rather than false comfort.
+
+**Right after a `/compact`** the newest turn on record predates the compaction
+and describes a context that no longer exists. When the compact boundary is
+newer than the last turn, its `compactMetadata.postTokens` is reported instead,
+so the tool does not answer "100% used" to "did the compact work?". Such a
+report has a `total` but no token breakdown, which is visible from
+`compactedAt` being later than `lastMessageAt`.
 
 **`truncated`** is true when the transcript was too large to read whole. The
 token counts are unaffected — they come from the tail — but anything found by
@@ -195,6 +210,12 @@ POST errors.
   the turn making the call was just written to that file — but two sessions
   sharing a working directory can be confused for one another. Pass
   `session_id` when it matters.
+- `sessionMatch` says which of those happened: `cwd` for the caller's own
+  project folder, `explicit` when asked for by id or path, and `fallback` when
+  the working directory had no folder of its own. A `fallback` report may
+  describe an unrelated project's session, so the text line labels it and
+  `get_usage` leaves it out of its context line entirely rather than passing
+  someone else's numbers off as yours.
 - The transcript format is Claude Code's, not ours, and is undocumented. Only
   a handful of fields are read, and `get_usage` degrades silently to its quota
   numbers if any of this breaks.
