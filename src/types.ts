@@ -124,6 +124,19 @@ export interface ContextTokens {
   total: number;
 }
 
+/**
+ * Where `contextWindowSize` came from, least certain last. `default` means the
+ * model's window is unknown and the smaller one was assumed — the report says
+ * so out loud, because an unflagged assumption is exactly what made the tool
+ * overstate a 1M session fivefold.
+ */
+export type ContextWindowSource =
+  | "override"
+  | "suffix"
+  | "model-table"
+  | "observed-prompt"
+  | "default";
+
 /** Context-window usage of one Claude Code session. */
 export interface ContextReport {
   sessionId: string | null;
@@ -133,6 +146,8 @@ export interface ContextReport {
   /** Model id as Claude Code writes it, `[1m]` suffix included. */
   model: string | null;
   contextWindowSize: number;
+  /** How that size was decided. */
+  contextWindowSource: ContextWindowSource;
   tokens: ContextTokens;
   /**
    * Growth since the previous main-chain turn; negative right after a compact.

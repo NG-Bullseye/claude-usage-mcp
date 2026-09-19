@@ -45,14 +45,14 @@ How full the **current session's context window** is — a different thing from
 subscription quota, which is what the two tools above report.
 
 ```
-context: 6% used (64 802 / 1 000 000 tokens), last turn +3 052
+context: 6% used (64 802 / 1 000 000 tokens, window from model table), last turn +3 052
 ```
 
 Returns `utilization` (0–100), `tokens` (`input`, `cacheCreation`, `cacheRead`,
 `output`, `total`), `remainingTokens`, `contextWindowSize`, `model`,
-`lastTurnTokens`, plus the `sessionId`, `cwd` and `transcriptPath` the numbers
-came from, `compactedAt` when the session has been compacted, `truncated` and
-`sessionMatch` (both below).
+`lastTurnTokens`, `contextWindowSource`, plus the `sessionId`, `cwd` and
+`transcriptPath` the numbers came from, `compactedAt` when the session has been
+compacted, `truncated` and `sessionMatch` (all explained below).
 
 Both arguments are optional and only needed to read a session other than the
 current one: `session_id`, or `transcript_path` for a transcript outside
@@ -77,26 +77,50 @@ Three kinds of entry are deliberately skipped:
   currently inert; it is kept because the field is part of the entry shape and
   costs nothing to honour.
 
-**Window size** is settled by arithmetic, not by the model id. The id alone
-cannot decide it: no `message.model` in a real transcript carries the `[1m]`
-suffix, and a `model` attachment — which does — is written when a model is
-*selected*, so a switch later in a long session leaves a stale one looking
-current. But a prompt cannot exceed the window it was sent to, so a prompt
-above 200 000 proves a 1M session whatever the id says. The order is:
-`CLAUDE_CONTEXT_WINDOW` if set, then a `[1m]` suffix, then the observed prompt,
-then 200 000.
+**Window size** is decided in a fixed order, and the report says which rule
+answered via `contextWindowSource`:
 
-The *prompt* — `input + cacheCreation + cacheRead` — not the prompt plus the
-reply. Testing the sum would put a discontinuity exactly where it hurts: a
-session sitting at 97% of 200k would be re-read as 20% of 1M the moment one
-longer reply carried the sum over the line, turning "nearly full" into "plenty
-of room" as it filled up.
+| Order | `contextWindowSource` | Rule |
+|---|---|---|
+| 1 | `override` | `CLAUDE_CONTEXT_WINDOW` is set to a positive number |
+| 2 | `suffix` | the model id carries `[1m]` |
+| 3 | `model-table` | the id matches a known family (below) |
+| 4 | `observed-prompt` | the prompt already exceeds 200 000, which only a 1M window allows |
+| 5 | `default` | none of the above — 200 000 is **assumed**, and the text line says so |
 
-Two consequences, both deliberately on the cautious side. A 1M session still
-under 200k with no attachment to prove it is measured against 200 000 and reads
-as fuller than it is; that corrects itself the moment the prompt passes 200k.
-And a 200k session whose reply carries the total just past the window reports
-100% with a total slightly above it — which is what being full looks like.
+Known families, as of 2026-06-24. Matched as a prefix of the id with any
+variant suffix stripped, so a point release inherits its family's window:
+
+| Family | Window |
+|---|---|
+| `claude-fable-5*`, `claude-mythos-5*` | 1 000 000 |
+| `claude-opus-5*`, `claude-opus-4-8*`, `claude-opus-4-7*`, `claude-opus-4-6*` | 1 000 000 |
+| `claude-sonnet-5*`, `claude-sonnet-4-6*` | 1 000 000 |
+| `claude-haiku-4-5*` | 200 000 |
+
+The table exists because the id alone is otherwise undecidable: no
+`message.model` in a real transcript carries the `[1m]` suffix, and the `model`
+attachment that does is written when a model is *selected*, so a switch later
+in a long session leaves a stale one looking current. Without the table a
+`claude-fable-5-1` session — 1M, no suffix, well under 200k used — was reported
+as 49% full while Claude Code's own status line said 10%.
+
+Rule 4 uses the *prompt* — `input + cacheCreation + cacheRead` — not the prompt
+plus the reply. Testing the sum would put a discontinuity exactly where it
+hurts: a session sitting at 97% of 200k would be re-read as 20% of 1M the
+moment one longer reply carried the sum over the line, turning "nearly full"
+into "plenty of room" as it filled up.
+
+Two consequences of rule 5, both deliberately on the cautious side. A 1M
+session on an unknown model, still under 200k with no attachment to prove it,
+is measured against 200 000 and reads as fuller than it is; that corrects
+itself the moment the prompt passes 200k. And a 200k session whose reply
+carries the total just past the window reports 100% with a total slightly above
+it — which is what being full looks like.
+
+The table is a cached fact, so it ages. When it is wrong, `CLAUDE_CONTEXT_WINDOW`
+is the immediate escape hatch, and **Claude Code's own status line is
+authoritative** over this tool.
 
 **Right after a `/compact`** the newest turn on record predates the compaction
 and describes a context that no longer exists. When the compact boundary is

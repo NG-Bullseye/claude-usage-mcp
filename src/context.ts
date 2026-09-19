@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 import {
   ContextReport,
+  ContextWindowSource,
   ContextTokens,
   TranscriptEntry,
   TranscriptUsage,
@@ -32,6 +33,26 @@ const DEFAULT_CONTEXT_WINDOW = 200_000;
 const LONG_CONTEXT_WINDOW = 1_000_000;
 
 /**
+ * Documented context windows, longest prefix first (as of 2026-06-24).
+ *
+ * Nearly every current model is 1M; Haiku 4.5 is the exception, and it earns
+ * an entry of its own so that 200 000 is reported as a known fact rather than
+ * as the fallback. Entries are prefixes of the suffix-stripped id, so a point
+ * release inherits its family's window.
+ */
+const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
+  ["claude-fable-5", LONG_CONTEXT_WINDOW],
+  ["claude-mythos-5", LONG_CONTEXT_WINDOW],
+  ["claude-opus-5", LONG_CONTEXT_WINDOW],
+  ["claude-opus-4-8", LONG_CONTEXT_WINDOW],
+  ["claude-opus-4-7", LONG_CONTEXT_WINDOW],
+  ["claude-opus-4-6", LONG_CONTEXT_WINDOW],
+  ["claude-sonnet-5", LONG_CONTEXT_WINDOW],
+  ["claude-sonnet-4-6", LONG_CONTEXT_WINDOW],
+  ["claude-haiku-4-5", DEFAULT_CONTEXT_WINDOW],
+];
+
+/**
  * Context window of `modelId`, in tokens.
  *
  * Model ids reach us as Claude Code writes them, so the 1M variants keep their
@@ -43,10 +64,20 @@ const LONG_CONTEXT_WINDOW = 1_000_000;
 export function contextWindowSizeFor(
   modelId: string | undefined,
   opts: { override?: string; observedPrompt?: number } = {},
-): number {
+): { size: number; source: ContextWindowSource } {
   const override = Number(opts.override);
-  if (Number.isFinite(override) && override > 0) return override;
-  if (modelId?.includes("[1m]")) return LONG_CONTEXT_WINDOW;
+  if (Number.isFinite(override) && override > 0) {
+    return { size: override, source: "override" };
+  }
+  if (modelId?.includes("[1m]")) {
+    return { size: LONG_CONTEXT_WINDOW, source: "suffix" };
+  }
+  // What the model family is actually documented to have. Claude Code sizes
+  // its own status line this way, and without it the tool reported a
+  // `claude-fable-5-1` session — 1M, no suffix, well under 200k used — as 49%
+  // full when the status line said 10%, prompting a needless compaction.
+  const known = knownContextWindow(modelId);
+  if (known !== null) return { size: known, source: "model-table" };
   // A prompt cannot exceed the window it was sent to, so a prompt above the
   // default settles the question that the model id cannot: no `message.model`
   // in a real transcript ever carries the `[1m]` suffix, yet prompts of 600k
@@ -57,8 +88,29 @@ export function contextWindowSizeFor(
   // discontinuity exactly where it hurts: a session at 97% of 200k would be
   // re-read as 20% of 1M the moment one longer reply carried the sum over the
   // line — turning "nearly full" into "plenty of room" as it filled up.
-  if ((opts.observedPrompt ?? 0) > DEFAULT_CONTEXT_WINDOW) return LONG_CONTEXT_WINDOW;
-  return DEFAULT_CONTEXT_WINDOW;
+  if ((opts.observedPrompt ?? 0) > DEFAULT_CONTEXT_WINDOW) {
+    return { size: LONG_CONTEXT_WINDOW, source: "observed-prompt" };
+  }
+  return { size: DEFAULT_CONTEXT_WINDOW, source: "default" };
+}
+
+/**
+ * Documented context window for a model id, or null when the family is unknown.
+ *
+ * Matched on the id with any variant suffix stripped, longest prefix first so
+ * `claude-opus-4-8` is not shadowed by a shorter `claude-opus-4` entry. This is
+ * a cached table, not a live lookup: the Models API exposes `max_input_tokens`,
+ * but fetching it would put a network call on a path that has to answer
+ * instantly and offline. A family that outgrows the table falls through to the
+ * arithmetic inference and, failing that, to a default the report flags.
+ */
+function knownContextWindow(modelId: string | undefined): number | null {
+  if (!modelId) return null;
+  const id = baseModelId(modelId);
+  for (const [prefix, size] of MODEL_CONTEXT_WINDOWS) {
+    if (id.startsWith(prefix)) return size;
+  }
+  return null;
 }
 
 export class ContextUnavailableError extends Error {}
@@ -225,16 +277,18 @@ export function parseTranscript(
       : last.tokens;
 
   const total = tokens.total;
-  const contextWindowSize = contextWindowSizeFor(model ?? undefined, {
+  const window = contextWindowSizeFor(model ?? undefined, {
     override: opts.contextWindowOverride,
     observedPrompt: promptOf(last.tokens),
   });
+  const contextWindowSize = window.size;
 
   return {
     sessionId: last.entry.sessionId ?? null,
     cwd: last.entry.cwd ?? null,
     model,
     contextWindowSize,
+    contextWindowSource: window.source,
     tokens,
     // With no previous turn, the growth is the whole total — but only if we
     // actually saw the start of the session. On a truncated read there is an
@@ -527,6 +581,29 @@ export function tryReadContextReport(
   }
 }
 
+/**
+ * How the window was decided, in words.
+ *
+ * A percentage is only as good as what it was divided by, and the division is
+ * invisible in a bare "6%". Naming the basis is what lets a reader catch a
+ * wrong one — and `default` is the one that has already misled someone, so it
+ * shouts rather than whispers.
+ */
+function windowBasis(source: ContextWindowSource): string {
+  switch (source) {
+    case "override":
+      return "window from CLAUDE_CONTEXT_WINDOW";
+    case "suffix":
+      return "window from the [1m] model id";
+    case "model-table":
+      return "window from model table";
+    case "observed-prompt":
+      return "window inferred from prompt size";
+    case "default":
+      return "window ASSUMED 200k for an unknown model — Claude Code's status line is authoritative";
+  }
+}
+
 /** Group thousands with spaces — locale-independent, unlike toLocaleString. */
 function groupThousands(value: number): string {
   const sign = value < 0 ? "-" : "";
@@ -542,7 +619,8 @@ export function formatContextLine(report: ContextReport): string {
       : `, last turn ${lastTurnTokens >= 0 ? "+" : ""}${groupThousands(lastTurnTokens)}`;
   const line =
     `context: ${utilization}% used ` +
-    `(${groupThousands(tokens.total)} / ${groupThousands(contextWindowSize)} tokens)` +
+    `(${groupThousands(tokens.total)} / ${groupThousands(contextWindowSize)} tokens, ` +
+    `${windowBasis(report.contextWindowSource)})` +
     turn;
   // Unlabelled, a fallback reads as the caller's own usage. It is not.
   return report.sessionMatch === "fallback"

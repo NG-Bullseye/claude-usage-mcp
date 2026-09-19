@@ -18,23 +18,82 @@ import {
 import { ContextReport } from "./types.js";
 
 test("a model id with the [1m] suffix gets the 1M context window", () => {
-  assert.equal(contextWindowSizeFor("claude-opus-5[1m]"), 1_000_000);
-});
-
-test("a plain model id gets the default 200k context window", () => {
-  assert.equal(contextWindowSizeFor("claude-sonnet-5"), 200_000);
+  assert.deepEqual(contextWindowSizeFor("claude-opus-5[1m]"), {
+    size: 1_000_000,
+    source: "suffix",
+  });
 });
 
 test("an unknown or missing model id falls back to the default window", () => {
-  assert.equal(contextWindowSizeFor(undefined), 200_000);
+  assert.deepEqual(contextWindowSizeFor(undefined), { size: 200_000, source: "default" });
 });
 
 test("CLAUDE_CONTEXT_WINDOW overrides the inferred window", () => {
-  assert.equal(contextWindowSizeFor("claude-opus-5[1m]", { override: "500000" }), 500_000);
+  assert.deepEqual(contextWindowSizeFor("claude-opus-5[1m]", { override: "500000" }), {
+    size: 500_000,
+    source: "override",
+  });
 });
 
 test("a non-numeric CLAUDE_CONTEXT_WINDOW is ignored", () => {
-  assert.equal(contextWindowSizeFor("claude-sonnet-5", { override: "lots" }), 200_000);
+  assert.equal(contextWindowSizeFor("claude-mystery-9", { override: "lots" }).size, 200_000);
+});
+
+// The id alone decides it whenever we know the family. Claude Code's own
+// status line sizes `claude-fable-5-1` against 1 000 000; without this table
+// the tool called the same session 49% full when it was at 10%.
+
+test("a known 1M family is recognised from the id, with no suffix needed", () => {
+  for (const id of [
+    "claude-fable-5-1",
+    "claude-fable-5",
+    "claude-mythos-5-1",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+  ]) {
+    assert.deepEqual(
+      contextWindowSizeFor(id),
+      { size: 1_000_000, source: "model-table" },
+      `wrong window for ${id}`,
+    );
+  }
+});
+
+test("Haiku 4.5 is known to be 200k, which is a fact and not a fallback", () => {
+  assert.deepEqual(contextWindowSizeFor("claude-haiku-4-5"), {
+    size: 200_000,
+    source: "model-table",
+  });
+});
+
+test("an override beats the model table", () => {
+  assert.deepEqual(contextWindowSizeFor("claude-fable-5-1", { override: "300000" }), {
+    size: 300_000,
+    source: "override",
+  });
+});
+
+test("an unknown family falls back to the default and says so", () => {
+  assert.deepEqual(contextWindowSizeFor("claude-mystery-9"), {
+    size: 200_000,
+    source: "default",
+  });
+});
+
+test("an unknown family with a large prompt is inferred, not defaulted", () => {
+  assert.deepEqual(contextWindowSizeFor("claude-mystery-9", { observedPrompt: 621_497 }), {
+    size: 1_000_000,
+    source: "observed-prompt",
+  });
+});
+
+test("the model table beats the arithmetic inference", () => {
+  assert.equal(
+    contextWindowSizeFor("claude-haiku-4-5", { observedPrompt: 621_497 }).source,
+    "model-table",
+  );
 });
 
 // No model id in a real transcript carries the `[1m]` suffix — `message.model`
@@ -42,16 +101,16 @@ test("a non-numeric CLAUDE_CONTEXT_WINDOW is ignored", () => {
 // cannot have been sent to a 200k model, so the size itself settles it.
 
 test("a prompt larger than the default window proves a 1M session", () => {
-  assert.equal(contextWindowSizeFor("claude-opus-5", { observedPrompt: 621_497 }), 1_000_000);
+  assert.equal(contextWindowSizeFor("claude-mystery-9", { observedPrompt: 621_497 }).size, 1_000_000);
 });
 
 test("a prompt within the default window leaves it at 200k", () => {
-  assert.equal(contextWindowSizeFor("claude-opus-5", { observedPrompt: 150_000 }), 200_000);
+  assert.equal(contextWindowSizeFor("claude-mystery-9", { observedPrompt: 150_000 }).size, 200_000);
 });
 
 test("an explicit override still wins over the observed size", () => {
   assert.equal(
-    contextWindowSizeFor("claude-opus-5", { override: "300000", observedPrompt: 621_497 }),
+    contextWindowSizeFor("claude-mystery-9", { override: "300000", observedPrompt: 621_497 }).size,
     300_000,
   );
 });
@@ -63,7 +122,7 @@ test("an explicit override still wins over the observed size", () => {
 
 test("output tokens do not push a full 200k session into the 1M bracket", () => {
   const report = parseTranscript([
-    assistantLine({ cacheRead: 197_296, output: 2_997, model: "claude-opus-5" }),
+    assistantLine({ cacheRead: 197_296, output: 2_997, model: "claude-mystery-9" }),
   ]);
 
   assert.equal(report.contextWindowSize, 200_000);
@@ -91,7 +150,7 @@ function assistantLine(opts: {
     timestamp: opts.timestamp ?? "2026-09-19T10:00:00.000Z",
     message: {
       id: opts.messageId,
-      model: opts.model ?? "claude-sonnet-5",
+      model: opts.model ?? "claude-testmodel-1",
       usage: {
         input_tokens: opts.input ?? 0,
         cache_creation_input_tokens: opts.cacheCreation ?? 0,
@@ -172,11 +231,11 @@ test("the latest model attachment wins when the model was switched mid-session",
   const report = parseTranscript([
     modelAttachmentLine("claude-opus-5[1m]"),
     assistantLine({ cacheRead: 10_000 }),
-    modelAttachmentLine("claude-sonnet-5"),
+    modelAttachmentLine("claude-testmodel-1"),
     assistantLine({ cacheRead: 20_000 }),
   ]);
 
-  assert.equal(report.model, "claude-sonnet-5");
+  assert.equal(report.model, "claude-testmodel-1");
   assert.equal(report.contextWindowSize, 200_000);
 });
 
@@ -240,12 +299,14 @@ test("a transcript with no assistant usage raises ContextUnavailableError", () =
 // silently sizes the window against the wrong model.
 
 test("an attachment naming a different model than the last turn is not believed", () => {
+  // The two disagree about the window as well as the name: believing the stale
+  // attachment would measure a 200k session against a megatoken.
   const report = parseTranscript([
     modelAttachmentLine("claude-opus-5[1m]"),
-    assistantLine({ cacheRead: 180_000, model: "claude-fable-5-1" }),
+    assistantLine({ cacheRead: 180_000, model: "claude-haiku-4-5" }),
   ]);
 
-  assert.equal(report.model, "claude-fable-5-1");
+  assert.equal(report.model, "claude-haiku-4-5");
   assert.equal(report.contextWindowSize, 200_000);
   assert.equal(report.utilization, 90);
 });
@@ -295,7 +356,7 @@ test("a synthetic zero-usage entry does not become the live context", () => {
   ]);
 
   assert.equal(report.tokens.total, 190_000);
-  assert.equal(report.model, "claude-sonnet-5");
+  assert.equal(report.model, "claude-testmodel-1");
 });
 
 test("a transcript of nothing but zero-usage entries raises ContextUnavailableError", () => {
@@ -383,7 +444,7 @@ test("a turn with no timestamp is not overridden by an undatable boundary", () =
   const undated = JSON.stringify({
     type: "assistant",
     isSidechain: false,
-    message: { model: "claude-sonnet-5", usage: { cache_read_input_tokens: 150_000 } },
+    message: { model: "claude-testmodel-1", usage: { cache_read_input_tokens: 150_000 } },
   });
   const report = parseTranscript([compactBoundaryLine("2026-09-19T10:05:00.000Z", 11_699), undated]);
 
@@ -609,7 +670,7 @@ test("the turn diff is not computed across the skipped middle", () => {
 test("an unknown turn cost is left out of the line rather than invented", () => {
   const line = formatContextLine(reportFor({ lastTurnTokens: null }));
 
-  assert.match(line, /^context: 6% used \(64 802 \/ 1 000 000 tokens\)$/);
+  assert.match(line, /^context: 6% used \(64 802 \/ 1 000 000 tokens, window from model table\)$/);
 });
 
 // ---- projectSlug / resolveTranscriptCandidates -----------------------------------
@@ -821,6 +882,7 @@ function reportFor(overrides: Partial<ContextReport>): ContextReport {
     cwd: "/work/repo",
     model: "claude-opus-5[1m]",
     contextWindowSize: 1_000_000,
+    contextWindowSource: "model-table",
     tokens: { input: 0, cacheCreation: 0, cacheRead: 64_802, output: 0, total: 64_802 },
     lastTurnTokens: 3_052,
     utilization: 6,
@@ -832,11 +894,33 @@ function reportFor(overrides: Partial<ContextReport>): ContextReport {
   };
 }
 
-test("the context line groups thousands and states the window it is against", () => {
+// The percentage is only as good as what it is divided by, and the division
+// is invisible in a bare "6%". Naming the basis is what lets a reader catch a
+// wrong one instead of acting on it.
+
+test("the context line groups thousands and names the basis of the window", () => {
   assert.equal(
     formatContextLine(reportFor({})),
-    "context: 6% used (64 802 / 1 000 000 tokens), last turn +3 052",
+    "context: 6% used (64 802 / 1 000 000 tokens, window from model table), last turn +3 052",
   );
+});
+
+test("an assumed window is a warning, not a quiet footnote", () => {
+  const line = formatContextLine(
+    reportFor({ contextWindowSource: "default", model: "claude-mystery-9" }),
+  );
+
+  assert.match(line, /window ASSUMED/);
+  assert.match(line, /status line is authoritative/);
+});
+
+test("each basis has its own wording", () => {
+  const wording = (source: ContextReport["contextWindowSource"]) =>
+    formatContextLine(reportFor({ contextWindowSource: source }));
+
+  assert.match(wording("override"), /CLAUDE_CONTEXT_WINDOW/);
+  assert.match(wording("suffix"), /\[1m\] model id/);
+  assert.match(wording("observed-prompt"), /inferred from prompt size/);
 });
 
 test("a fallback session is labelled, so its numbers are not read as the caller's", () => {
@@ -848,6 +932,6 @@ test("a fallback session is labelled, so its numbers are not read as the caller'
 test("a turn that shrank the context keeps its negative sign", () => {
   assert.equal(
     formatContextLine(reportFor({ lastTurnTokens: -120_400 })),
-    "context: 6% used (64 802 / 1 000 000 tokens), last turn -120 400",
+    "context: 6% used (64 802 / 1 000 000 tokens, window from model table), last turn -120 400",
   );
 });
