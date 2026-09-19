@@ -268,10 +268,11 @@ export function parseTranscript(
  */
 export function readTranscriptLines(
   filePath: string,
-  opts: { headBytes?: number; tailBytes?: number } = {},
+  opts: { headBytes?: number; tailBytes?: number; maxTailBytes?: number } = {},
 ): { lines: string[]; truncated: boolean; contiguousFrom: number } {
   const headBytes = opts.headBytes ?? HEAD_BYTES;
   const tailBytes = opts.tailBytes ?? TAIL_BYTES;
+  const maxTailBytes = opts.maxTailBytes ?? MAX_TAIL_BYTES;
 
   let fd: number;
   try {
@@ -299,32 +300,55 @@ export function readTranscriptLines(
     // megabyte — and if such a line is last, the tail holds no complete turn
     // at all. The report would then fall back to a turn from the head, i.e.
     // session start, and be quietly, plausibly wrong. So grow until the tail
-    // holds real turns.
-    for (let want = tailBytes; ; want *= 4) {
+    // holds two calls: two, because one is nothing to measure growth against.
+    //
+    // `want` never starts at zero, or the loop would never advance.
+    let want = Math.max(1, tailBytes);
+    for (;;) {
+      // Once the tail reaches back into the head the two overlap, repeating
+      // lines and putting `contiguousFrom` in the wrong place. At that point
+      // they together already span the file, so read it straight through.
       const from = size - want;
-      if (from <= 0) return whole();
+      if (from <= headBytes) return whole();
+
       const tail = splitLines(readChunk(fd, from, size - from)).slice(1);
-      const turns = countUsableTurns(tail);
-      if (turns >= 2 || (turns >= 1 && want >= MAX_TAIL_BYTES)) {
+      const calls = countUsableCalls(tail);
+      if (calls >= 2 || (calls >= 1 && want >= maxTailBytes)) {
         return { lines: [...head, ...tail], truncated: true, contiguousFrom: head.length };
       }
+      // Step onto the ceiling exactly, so it can take effect; ×4 alone jumps
+      // straight over it and reads the whole file instead. Past the ceiling
+      // with still no call in sight, keep growing: a stale answer is worse
+      // than a large read.
+      want = want < maxTailBytes ? Math.min(want * 4, maxTailBytes) : want * 4;
     }
   } finally {
     fs.closeSync(fd);
   }
 }
 
-/** Assistant turns in `lines` that carry real token counts. */
-function countUsableTurns(lines: string[]): number {
-  let n = 0;
+/**
+ * Distinct API calls in `lines` that carry real token counts.
+ *
+ * Calls, not entries: Claude Code writes one entry per content block, so a
+ * single final turn of thinking + text + tool_use looks like three. Counting
+ * those as three would stop the tail growing with only one call to hand, and
+ * the turn cost — which needs two — would come back unknown.
+ */
+function countUsableCalls(lines: string[]): number {
+  const callIds = new Set<string>();
+  let unidentified = 0;
   for (const line of lines) {
     if (!line.includes('"usage"')) continue;
     const entry = parseEntry(line);
     if (!entry || entry.isSidechain || entry.type !== "assistant") continue;
     const usage = entry.message?.usage;
-    if (usage && sumUsage(usage).total > 0) n++;
+    if (!usage || sumUsage(usage).total === 0) continue;
+    const id = entry.message?.id;
+    if (id) callIds.add(id);
+    else unidentified++;
   }
-  return n;
+  return callIds.size + unidentified;
 }
 
 function readChunk(fd: number, position: number, length: number): string {

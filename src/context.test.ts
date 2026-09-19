@@ -491,6 +491,104 @@ test("the tail grows past a giant trailing line rather than reporting stale turn
   assert.equal(report.lastTurnTokens, 50_000);
 });
 
+// The tail must hold two *calls* to have something to diff against. Counting
+// entries instead lets one multi-block final turn — thinking + text + tool_use,
+// the ordinary shape — satisfy the gate on its own, and the growth stops one
+// step too early with nothing to compare.
+
+test("the tail grows for a second call, not merely a second entry", (t) => {
+  const file = path.join(tempDir(t), "session.jsonl");
+  const filler = Array.from({ length: 8 }, (_, i) =>
+    JSON.stringify({ type: "user", note: `filler ${i}`.padEnd(110, "x") }),
+  );
+  fs.writeFileSync(
+    file,
+    [
+      assistantLine({ cacheRead: 1_000, messageId: "call_a" }),
+      ...filler,
+      assistantLine({ cacheRead: 5_000, messageId: "call_b" }),
+      assistantLine({ cacheRead: 5_000, messageId: "call_b" }),
+      assistantLine({ cacheRead: 5_000, messageId: "call_b" }),
+    ].join("\n"),
+  );
+
+  const read = readTranscriptLines(file, { headBytes: 200, tailBytes: 900 });
+  const report = parseTranscript(read.lines, {
+    truncated: read.truncated,
+    contiguousFrom: read.contiguousFrom,
+  });
+
+  assert.equal(report.tokens.total, 5_000);
+  assert.equal(report.lastTurnTokens, 4_000);
+});
+
+// Growing the tail is bounded: past the ceiling, one usable call is accepted
+// rather than pulling a hundred-megabyte transcript into memory on every call.
+
+test("the growth ceiling is stepped onto exactly, not jumped over", (t) => {
+  const file = path.join(tempDir(t), "session.jsonl");
+  const filler = Array.from({ length: 20 }, (_, i) =>
+    JSON.stringify({ type: "user", note: `filler-${i}`.padEnd(110, "x") }),
+  );
+  fs.writeFileSync(
+    file,
+    [
+      assistantLine({ cacheRead: 1_000, messageId: "call_a" }),
+      ...filler,
+      assistantLine({ cacheRead: 5_000, messageId: "call_b" }),
+    ].join("\n"),
+  );
+
+  // 1 200 finds only the last call, so the tail grows. Multiplying by four
+  // would overshoot both the 2 000-byte ceiling and the file, reading it
+  // whole; stepping onto the ceiling stops there and keeps the read bounded.
+  const read = readTranscriptLines(file, {
+    headBytes: 200,
+    tailBytes: 1_200,
+    maxTailBytes: 2_000,
+  });
+
+  assert.equal(read.truncated, true);
+});
+
+// Head and tail are read from fixed ends. Once a growth step reaches back past
+// the head, the two overlap and the stitched array repeats lines — which also
+// makes `contiguousFrom` point at the wrong place.
+
+test("a tail that grows back into the head does not duplicate lines", (t) => {
+  const file = path.join(tempDir(t), "session.jsonl");
+  const block = (from: number, count: number) =>
+    Array.from({ length: count }, (_, i) =>
+      JSON.stringify({ type: "user", note: `unique-${from + i}`.padEnd(110, "x") }),
+    );
+  // The two calls sit ~5 700 bytes in: past a 3 000-byte tail, so the tail
+  // grows; and past the point the grown tail reaches back to, which lands
+  // inside the 5 000-byte head.
+  fs.writeFileSync(
+    file,
+    [
+      ...block(0, 40),
+      assistantLine({ cacheRead: 1_000, messageId: "call_a" }),
+      assistantLine({ cacheRead: 2_000, messageId: "call_b" }),
+      ...block(100, 79),
+    ].join("\n"),
+  );
+
+  const { lines } = readTranscriptLines(file, { headBytes: 5_000, tailBytes: 3_000 });
+
+  assert.equal(new Set(lines).size, lines.length);
+});
+
+test("a zero-byte tail budget does not spin forever", { timeout: 5_000 }, (t) => {
+  const file = path.join(tempDir(t), "session.jsonl");
+  fs.writeFileSync(
+    file,
+    Array.from({ length: 60 }, () => assistantLine({ cacheRead: 1_000 })).join("\n"),
+  );
+
+  assert.ok(readTranscriptLines(file, { headBytes: 200, tailBytes: 0 }).lines.length > 0);
+});
+
 // Head and tail are stitched together with a gap in between. Diffing the first
 // tail turn against the last head turn measures the whole skipped middle and
 // calls it one turn.
