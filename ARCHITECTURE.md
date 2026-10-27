@@ -2,9 +2,13 @@
 
 ## Deep Modules — OAuth-Usage → Forecast → Velocity
 
+> Stand 2026-10-27 · geprüft gegen cd88239
+
 Der Hauptflow liest die Claude-Code-OAuth-Credentials, fragt `GET /api/oauth/usage` ab (fetch, Fallback curl), rechnet je Fenster (5h, weekly, weekly_opus) Forecast und Velocity-Empfehlung und löst optional einen Threshold-Webhook aus. Zwei Einstiege auf denselben Kern: `src/index.ts` (MCP stdio) und `src/cli.ts`. Jede Innenleben-Zelle ist datei:zeile und muss per grep -n treffen.
 
 ## Flow
+
+> Stand 2026-10-27 · geprüft gegen cd88239
 
 **Sequenz** (`src/index.ts:35 buildReport(usage)`)
 
@@ -26,9 +30,13 @@ Der Hauptflow liest die Claude-Code-OAuth-Credentials, fragt `GET /api/oauth/usa
 
 ## Schnittstellen
 
+> Stand 2026-10-27 · geprüft gegen cd88239
+
 - MCP stdio, Build `dist/` (gitignored, `npm run build`).
 - Webhook-Zustand `~/.cache/claude-usage-mcp/webhook-state.json` (`src/webhook.ts:33 STATE_FILE`).
 
 ## Standard: Deep Modules + Flow
+
+> Stand 2026-10-27 · geprüft gegen cd88239
 
 Kanon: `~/repos/speech-engine/ARCHITECTURE.md` § Standard (R1–R5).
