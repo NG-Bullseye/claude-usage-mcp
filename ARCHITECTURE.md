@@ -2,7 +2,7 @@
 
 ## Deep Modules — OAuth-Usage → Forecast → Velocity
 
-> Stand 2026-10-27 · geprüft gegen cd88239
+> Stand 2026-11-10 · geprüft gegen b356565
 
 Der Hauptflow liest die Claude-Code-OAuth-Credentials, fragt `GET /api/oauth/usage` ab (fetch, Fallback curl), rechnet je Fenster (5h, weekly, weekly_opus) Forecast und Velocity-Empfehlung und löst optional einen Threshold-Webhook aus. Zwei Einstiege auf denselben Kern: `src/index.ts` (MCP stdio) und `src/cli.ts`. Jede Innenleben-Zelle ist datei:zeile und muss per grep -n treffen.
 
@@ -40,3 +40,28 @@ Der Hauptflow liest die Claude-Code-OAuth-Credentials, fragt `GET /api/oauth/usa
 > Stand 2026-10-27 · geprüft gegen cd88239
 
 Kanon: `~/repos/speech-engine/ARCHITECTURE.md` § Standard (R1–R5).
+
+<!-- graph:auto:start -->
+## Graph-Auto (generated 2026-11-10 by `bin/arch_auto_block.py`, do not edit by hand)
+
+**Deep Modules** (cross-file edges):
+- `src/client.ts` — 17
+- `src/types.ts` — 14
+- `src/index.ts` — 11
+- `src/forecast.ts` — 8
+- `src/cli.ts` — 6
+- `src/webhook.ts` — 4
+
+**Interfaces** (modules/symbols imported or called from other files):
+- `src/index.ts` — used by 3 files
+- `src/webhook.ts` — used by 2 files
+- `src/cli.ts` — used by 1 files
+- `src/cli.ts::main()` — used by 1 files
+- `src/client.ts` — used by 1 files
+- `src/types.ts` — used by 1 files
+- `src/types.ts::ClaudeCredentials` — used by 1 files
+- `src/types.ts::ClaudeApiUsageResponse` — used by 1 files
+
+**Bus connections** (redis / route / http nodes of the house graph):
+- none
+<!-- graph:auto:end -->
