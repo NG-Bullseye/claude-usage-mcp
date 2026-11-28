@@ -65,6 +65,8 @@ velocity  = ((100 - u) / remaining) / rate * 100   # clamped to [0, 120]
 
 ## Install & build
 
+Setup in einem Schritt (idempotent, startet keinen Dienst): `bash bootstrap.sh`
+
 ```bash
 npm install
 npm run build
